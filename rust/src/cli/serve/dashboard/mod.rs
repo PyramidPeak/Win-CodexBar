@@ -39,9 +39,9 @@ impl DashboardState {
     /// Production wiring: live producer behind the TTL coordinator.
     pub fn live(refresh_seconds: u32, identity: Option<DashboardIdentity>) -> Self {
         let producer = source::SnapshotProducer::new(refresh_seconds, identity);
-        let coordinator = SnapshotCoordinator::new(
+        let coordinator = SnapshotCoordinator::new_with_artifacts(
             std::time::Duration::from_secs(refresh_seconds.max(1) as u64),
-            std::sync::Arc::new(move || producer.collect()),
+            std::sync::Arc::new(move || producer.collect_artifacts()),
         );
         Self {
             coordinator,
@@ -59,6 +59,22 @@ impl DashboardState {
     ) -> Self {
         Self {
             coordinator: SnapshotCoordinator::new(
+                std::time::Duration::from_secs(ttl_seconds as u64),
+                build,
+            ),
+            identity,
+            refresh_seconds: 60,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stub_with_artifacts(
+        build: coordinator::SnapshotArtifactsBuildFn,
+        ttl_seconds: u32,
+        identity: Option<DashboardIdentity>,
+    ) -> Self {
+        Self {
+            coordinator: SnapshotCoordinator::new_with_artifacts(
                 std::time::Duration::from_secs(ttl_seconds as u64),
                 build,
             ),

@@ -17,12 +17,34 @@ use crate::core::{CostScanOptions, FetchContext, ProviderId, SourceMode, instant
 use crate::cost_scanner::{self, CostScanner};
 use crate::settings::Settings;
 
+use crate::cli::serve::metrics::MetricsSnapshot;
+
 use super::snapshot::{
     AccountFetchEnvelope, ClaudeAccountsInput, DashboardIdentity, ProviderFetchEnvelope,
     RawCostPayload, SnapshotInput, SnapshotPayload, build_snapshot,
 };
 
 pub type BoxSnapshotFuture = Pin<Box<dyn Future<Output = Result<SnapshotPayload, String>> + Send>>;
+pub(crate) type BoxSnapshotArtifactsFuture =
+    Pin<Box<dyn Future<Output = Result<SnapshotArtifacts, String>> + Send>>;
+
+/// One provider collection projected into independent dashboard and metrics
+/// views. The metrics sidecar stays internal so the public dashboard-v1 DTOs
+/// remain source-compatible for Rust callers.
+#[derive(Clone)]
+pub(crate) struct SnapshotArtifacts {
+    pub dashboard: SnapshotPayload,
+    pub metrics: Option<MetricsSnapshot>,
+}
+
+impl SnapshotArtifacts {
+    pub(crate) fn dashboard_only(dashboard: SnapshotPayload) -> Self {
+        Self {
+            dashboard,
+            metrics: None,
+        }
+    }
+}
 
 /// Hard bound per provider fetch inside a dashboard build. Existing serve
 /// `web_timeout` is 60 s; builds add a 75 s outer envelope (provider-internal
@@ -63,10 +85,15 @@ impl SnapshotProducer {
 
     pub fn collect(&self) -> BoxSnapshotFuture {
         let this = self.clone();
-        Box::pin(async move { this.collect_inner().await })
+        Box::pin(async move { Ok(this.collect_artifacts_inner().await?.dashboard) })
     }
 
-    async fn collect_inner(&self) -> Result<SnapshotPayload, String> {
+    pub(crate) fn collect_artifacts(&self) -> BoxSnapshotArtifactsFuture {
+        let this = self.clone();
+        Box::pin(async move { this.collect_artifacts_inner().await })
+    }
+
+    async fn collect_artifacts_inner(&self) -> Result<SnapshotArtifacts, String> {
         let settings = Settings::load();
         // Resolve identity: explicit --identity flag wins; otherwise follow
         // the app's hide_personal_info setting (upstream 0.50.1 #2960).
@@ -122,7 +149,11 @@ impl SnapshotProducer {
             order,
             enabled,
         };
-        Ok(build_snapshot(&input))
+        let metrics = MetricsSnapshot::from_input(&input);
+        Ok(SnapshotArtifacts {
+            dashboard: build_snapshot(&input),
+            metrics: Some(metrics),
+        })
     }
 }
 

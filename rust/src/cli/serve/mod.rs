@@ -13,6 +13,7 @@
 
 pub mod dashboard;
 mod data;
+mod metrics;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,9 +75,14 @@ pub struct ServeArgs {
     #[arg(long = "refresh-interval", default_value = "60")]
     pub refresh_interval: u64,
 
-    /// Bearer token for /usage and /cost (prefer CODEXBAR_DASHBOARD_TOKEN)
+    /// Bearer token for data, dashboard snapshot, and enabled metrics routes
+    /// (prefer CODEXBAR_DASHBOARD_TOKEN)
     #[arg(long = "dashboard-token", env = "CODEXBAR_DASHBOARD_TOKEN")]
     pub dashboard_token: Option<String>,
+
+    /// Enable the Prometheus text endpoint at /metrics
+    #[arg(long = "metrics", default_value_t = false)]
+    pub metrics: bool,
 
     /// Accept sending the dashboard token over cleartext HTTP on a non-loopback host
     #[arg(long = "allow-plain-http", default_value_t = false)]
@@ -95,6 +101,7 @@ struct ServeConfig {
     host: String,
     port: u16,
     token_digest: Option<[u8; 32]>,
+    metrics_enabled: bool,
     /// Overall budget for reading one request head. Production uses
     /// [`HEAD_READ_TIMEOUT`]; tests inject a short budget (upstream 0.48.0
     /// #2684 makes the deadline injectable for exactly this reason).
@@ -123,10 +130,13 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         "CodexBar server listening on http://{}:{}",
         config.host, config.port
     );
+    if config.metrics_enabled {
+        eprintln!("Prometheus metrics enabled at /metrics");
+    }
     if !is_loopback_host(&config.host) {
         eprintln!(
-            "Warning: plain HTTP on a non-loopback host; the bearer token gating \
-             /usage and /cost crosses the network in cleartext on every request."
+            "Warning: plain HTTP on a non-loopback host; the bearer token for \
+             protected data routes crosses the network in cleartext."
         );
     }
 
@@ -196,6 +206,7 @@ fn validate_serve_args(args: &ServeArgs) -> anyhow::Result<ServeConfig> {
         host,
         port: args.port,
         token_digest: token.as_ref().map(|t| sha256_digest(t.as_bytes())),
+        metrics_enabled: args.metrics,
         head_read_budget: HEAD_READ_TIMEOUT,
         identity,
         dashboard: None,
@@ -435,6 +446,8 @@ enum ServeRoute {
     Cost {
         provider: Option<String>,
     },
+    /// `GET /metrics` — optional Prometheus text exposition endpoint.
+    Metrics,
     /// `GET /dashboard/v1/snapshot` — stable dashboard-v1 JSON contract.
     DashboardSnapshot,
 }
@@ -446,6 +459,7 @@ fn resolve_route(request: &ServeRequest) -> Option<ServeRoute> {
         "/health" => Some(ServeRoute::Health),
         "/usage" => Some(ServeRoute::Usage { provider }),
         "/cost" => Some(ServeRoute::Cost { provider }),
+        "/metrics" => Some(ServeRoute::Metrics),
         "/dashboard/v1/snapshot" => Some(ServeRoute::DashboardSnapshot),
         path if path.starts_with("/icons/") && path.ends_with(".svg") => {
             let name = &path["/icons/".len()..path.len() - ".svg".len()];
@@ -513,6 +527,24 @@ async fn route_request(request: &ServeRequest, config: &ServeConfig) -> String {
                 return unauthorized_response();
             }
             data::cost_response(provider.as_deref()).await
+        }
+        ServeRoute::Metrics => {
+            if !config.metrics_enabled {
+                return json_response(404, serde_json::json!({ "error": "not found" }));
+            }
+            if !authorize_request(
+                request.authorization.as_deref(),
+                config.token_digest.as_ref(),
+            ) {
+                return unauthorized_dashboard_response();
+            }
+            match &config.dashboard {
+                Some(state) => metrics::response(state),
+                None => json_response(
+                    500,
+                    serde_json::json!({ "error": "dashboard not configured" }),
+                ),
+            }
         }
         ServeRoute::DashboardSnapshot => {
             if !authorize_request(

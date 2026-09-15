@@ -8,6 +8,11 @@
 //! but every waiter that joined the failing generation receives that same
 //! stored error (the builder still reports it once), while only the NEXT
 //! caller retries with a fresh build.
+//!
+//! Prometheus scrapes use stale-while-refresh: they return the last successful
+//! snapshot immediately and only trigger an expired/missing build in the
+//! background. The dashboard's [`SnapshotCoordinator::get`] contract remains
+//! wait-for-fresh, with both callers sharing the same build generation.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -17,15 +22,19 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio::sync::futures::OwnedNotified;
 
+use crate::cli::serve::metrics::MetricsSnapshot;
+
 use super::snapshot::SnapshotPayload;
-use super::source::BoxSnapshotFuture;
+use super::source::{BoxSnapshotArtifactsFuture, BoxSnapshotFuture, SnapshotArtifacts};
 
 /// Pluggable snapshot collector (production: provider+cost scan; tests: stub).
 pub type SnapshotBuildFn = Arc<dyn Fn() -> BoxSnapshotFuture + Send + Sync>;
+pub(crate) type SnapshotArtifactsBuildFn =
+    Arc<dyn Fn() -> BoxSnapshotArtifactsFuture + Send + Sync>;
 
 /// A single build generation: everything a waiter needs to receive THAT
 /// generation's exact outcome. Owning the notification channel and the stored
-/// outcome together (instead of re-deriving the result from the global slot
+/// outcome together (instead of re-deriving the result from global state
 /// after a wake) is what lets all of one generation's waiters fan out to the
 /// same error, while a cancelled/dropped build (outcome `None` forever)
 /// cleanly routes waiters into a retry loop.
@@ -39,14 +48,19 @@ struct Flight {
     outcome: StdMutex<Option<Result<Arc<SnapshotPayload>, String>>>,
 }
 
-#[derive(Debug)]
-enum Slot {
-    /// No build yet, or last attempt failed (errors are not cached).
-    Empty,
-    /// A build generation is running; joining callers wait on its `Flight`.
-    Building(Arc<Flight>),
-    /// Last good build result + when it completed.
-    Ready(Arc<SnapshotPayload>, Instant),
+#[derive(Clone, Debug)]
+struct CachedSnapshot {
+    payload: Arc<SnapshotPayload>,
+    metrics: Option<Arc<MetricsSnapshot>>,
+    built_at: Instant,
+}
+
+/// Cache and in-flight generation are deliberately independent: an expired
+/// successful snapshot remains available while its replacement is built.
+#[derive(Debug, Default)]
+struct CoordinatorState {
+    cached: Option<CachedSnapshot>,
+    flight: Option<Arc<Flight>>,
 }
 
 impl std::fmt::Debug for SnapshotCoordinator {
@@ -61,17 +75,67 @@ impl std::fmt::Debug for SnapshotCoordinator {
 #[derive(Clone)]
 pub struct SnapshotCoordinator {
     ttl: Duration,
-    build: SnapshotBuildFn,
-    slot: Arc<StdMutex<Slot>>,
+    build: SnapshotArtifactsBuildFn,
+    state: Arc<StdMutex<CoordinatorState>>,
 }
 
 impl SnapshotCoordinator {
     pub fn new(ttl: Duration, build: SnapshotBuildFn) -> Self {
+        let build_artifacts: SnapshotArtifactsBuildFn = Arc::new(move || {
+            let future = build();
+            Box::pin(async move { future.await.map(SnapshotArtifacts::dashboard_only) })
+        });
+        Self::new_with_artifacts(ttl, build_artifacts)
+    }
+
+    pub(crate) fn new_with_artifacts(ttl: Duration, build: SnapshotArtifactsBuildFn) -> Self {
         Self {
             ttl,
             build,
-            slot: Arc::new(StdMutex::new(Slot::Empty)),
+            state: Arc::new(StdMutex::new(CoordinatorState::default())),
         }
+    }
+
+    /// Return the last successful snapshot immediately and ensure an expired
+    /// or missing cache is refreshed in the background. Concurrent callers
+    /// share one refresh. When no Tokio runtime is active, this remains a pure
+    /// cache lookup rather than claiming a flight that cannot be driven.
+    fn latest_or_trigger_refresh(&self) -> Option<Arc<SnapshotPayload>> {
+        self.latest_cached_or_trigger_refresh()
+            .map(|cached| cached.payload)
+    }
+
+    pub(crate) fn latest_metrics_or_trigger_refresh(&self) -> Option<Arc<MetricsSnapshot>> {
+        self.latest_cached_or_trigger_refresh()
+            .and_then(|cached| cached.metrics)
+    }
+
+    fn latest_cached_or_trigger_refresh(&self) -> Option<CachedSnapshot> {
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let mut claimed = None;
+        let cached = {
+            let mut state = self.state.lock().expect("coordinator poisoned");
+            let cached = state.cached.clone();
+            let fresh = state
+                .cached
+                .as_ref()
+                .is_some_and(|cached| cached.built_at.elapsed() < self.ttl);
+
+            if !fresh && state.flight.is_none() && runtime.is_some() {
+                let flight = new_flight();
+                state.flight = Some(flight.clone());
+                claimed = Some(flight);
+            }
+            cached
+        };
+
+        if let (Some(runtime), Some(flight)) = (runtime, claimed) {
+            // The guard is constructed before the future is spawned. If the
+            // runtime shuts down before its first poll, dropping that unpolled
+            // future still clears the claimed flight and wakes waiters.
+            drop(runtime.spawn(self.claimed_build_task(flight)));
+        }
+        cached
     }
 
     /// Get a snapshot: serve the fresh cached build when younger than `ttl`,
@@ -84,8 +148,8 @@ impl SnapshotCoordinator {
             //
             // Waiter lost-wakeup contract: the waiter creates AND enables its
             // `OwnedNotified` while holding this same decision guard — the
-            // guard that observes `Slot::Building`. For the slot itself (the
-            // global cache/generation pointer) the builder holds this same
+            // guard that observes an in-flight generation. For the shared
+            // cache/generation state the builder holds this same
             // mutex for every update (success, error, or guard-driven reset);
             // the per-flight outcome is stored under the flight's own mutex
             // strictly BEFORE `notify_waiters`, which is what any woken waiter
@@ -94,7 +158,7 @@ impl SnapshotCoordinator {
             // list and no `notify_waiters` for this build can have fired in
             // between. The registered future is then carried out past the
             // guard drop and awaited unlocked (`OwnedNotified` owns the
-            // `Arc<Notify>`, so no borrow of the guard or slot contents
+            // `Arc<Notify>`, so no borrow of the guard or state contents
             // escapes the critical section).
             enum Decision {
                 Serve(Arc<SnapshotPayload>),
@@ -102,36 +166,33 @@ impl SnapshotCoordinator {
                 Build(Arc<Flight>),
             }
             let decision = {
-                let mut slot = self.slot.lock().expect("coordinator poisoned");
-                match &mut *slot {
-                    Slot::Ready(payload, built_at) if built_at.elapsed() < self.ttl => {
-                        Decision::Serve(payload.clone())
-                    }
-                    Slot::Building(flight) => {
-                        // Register AND enable the waiter on THIS flight's Notify
-                        // before releasing the guard that observed Building —
-                        // closes the `notify_waiters` lost-wakeup window: a build
-                        // completing in the instant after our decision cannot
-                        // fire before this future is on the wait list.
-                        let mut notified = Box::pin(flight.notify.clone().notified_owned());
-                        notified.as_mut().enable();
-                        Decision::Wait(flight.clone(), notified)
-                    }
-                    Slot::Empty | Slot::Ready(_, _) => {
-                        let flight = Arc::new(Flight {
-                            notify: Arc::new(Notify::new()),
-                            outcome: StdMutex::new(None),
-                        });
-                        *slot = Slot::Building(flight.clone());
-                        Decision::Build(flight)
-                    }
+                let mut state = self.state.lock().expect("coordinator poisoned");
+                if let Some(cached) = state
+                    .cached
+                    .as_ref()
+                    .filter(|cached| cached.built_at.elapsed() < self.ttl)
+                {
+                    Decision::Serve(cached.payload.clone())
+                } else if let Some(flight) = &state.flight {
+                    // Register AND enable the waiter on THIS flight's Notify
+                    // before releasing the guard that observed it —
+                    // closes the `notify_waiters` lost-wakeup window: a build
+                    // completing in the instant after our decision cannot
+                    // fire before this future is on the wait list.
+                    let mut notified = Box::pin(flight.notify.clone().notified_owned());
+                    notified.as_mut().enable();
+                    Decision::Wait(flight.clone(), notified)
+                } else {
+                    let flight = new_flight();
+                    state.flight = Some(flight.clone());
+                    Decision::Build(flight)
                 }
             };
             match decision {
                 Decision::Serve(payload) => return Ok(payload),
                 Decision::Wait(flight, notified) => {
                     // Already registered+enabled under the guard that observed
-                    // `Slot::Building`; await after unlock — no lock is held
+                    // the flight; await after unlock — no lock is held
                     // across this await.
                     notified.await;
                     // The builder stores the flight outcome BEFORE notifying,
@@ -139,7 +200,7 @@ impl SnapshotCoordinator {
                     // joined: every waiter of it fans out to the same success
                     // (cheaply cloned `Arc`) or the same error. `None` means
                     // the builder was cancelled/panicked mid-flight and its
-                    // guard already reset the global slot to `Empty` — re-scan
+                    // guard already cleared the abandoned flight — re-scan
                     // and retry; no result is ever fabricated here.
                     let outcome = flight.outcome.lock().expect("coordinator poisoned").clone();
                     match outcome {
@@ -148,68 +209,98 @@ impl SnapshotCoordinator {
                     }
                 }
                 Decision::Build(flight) => {
-                    // A build that exits, is cancelled, or panics resets the
-                    // stranded `Slot::Building` to `Empty` and wakes waiters so
-                    // they start a fresh build instead of hanging on a `Notify`
-                    // that can no longer fire.
-                    let mut guard = BuildGuard::new(self.slot.clone(), flight.clone());
-                    let outcome = (self.build)().await.map(Arc::new);
-
-                    // Store THIS generation's outcome first: enabling
-                    // notifications were all registered under decision guards,
-                    // and waiters only read the outcome after being notified —
-                    // storing before `notify_waiters` guarantees every woken
-                    // waiter observes it.
-                    *flight.outcome.lock().expect("coordinator poisoned") = Some(outcome.clone());
-
-                    let mut slot = self.slot.lock().expect("coordinator poisoned");
-                    match &outcome {
-                        Ok(payload) => {
-                            // Success caches globally for TTL reuse.
-                            *slot = Slot::Ready(payload.clone(), Instant::now());
-                        }
-                        Err(_) => {
-                            // Errors never cache: the NEXT request retries
-                            // fresh, while THIS generation's joined waiters
-                            // still fan out to the stored error above.
-                            *slot = Slot::Empty;
-                        }
-                    }
-                    drop(slot);
-                    // The slot now reflects completion; defuse the guard so its
-                    // drop does not reset a build we already finished.
-                    guard.disarm();
-                    flight.notify.notify_waiters();
-                    return outcome;
+                    let guard = BuildGuard::new(self.state.clone(), flight.clone());
+                    return self.run_claimed_build(flight, guard).await;
                 }
             }
         }
     }
+
+    /// Build a `'static` task after synchronously constructing its completion
+    /// guard. This ordering makes dropping an unpolled task safe.
+    fn claimed_build_task(
+        &self,
+        flight: Arc<Flight>,
+    ) -> impl std::future::Future<Output = Result<Arc<SnapshotPayload>, String>> + Send + 'static
+    {
+        let guard = BuildGuard::new(self.state.clone(), flight.clone());
+        let coordinator = self.clone();
+        async move { coordinator.run_claimed_build(flight, guard).await }
+    }
+
+    /// Drive a flight already installed in `state`. Foreground dashboard builds
+    /// and detached metrics refreshes finish through this exact path.
+    async fn run_claimed_build(
+        &self,
+        flight: Arc<Flight>,
+        mut guard: BuildGuard,
+    ) -> Result<Arc<SnapshotPayload>, String> {
+        let built = (self.build)().await;
+        let outcome = built.map(|artifacts| {
+            (
+                Arc::new(artifacts.dashboard),
+                artifacts.metrics.map(Arc::new),
+            )
+        });
+        let waiter_outcome = outcome
+            .as_ref()
+            .map(|(payload, _)| payload.clone())
+            .map_err(Clone::clone);
+
+        // Store this generation's outcome before publishing state and waking
+        // waiters, so every registered waiter receives the exact same result.
+        *flight.outcome.lock().expect("coordinator poisoned") = Some(waiter_outcome.clone());
+
+        let mut state = self.state.lock().expect("coordinator poisoned");
+        if state
+            .flight
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &flight))
+        {
+            if let Ok((payload, metrics)) = &outcome {
+                state.cached = Some(CachedSnapshot {
+                    payload: payload.clone(),
+                    metrics: metrics.clone(),
+                    built_at: Instant::now(),
+                });
+            }
+            // Failed refreshes leave the last successful cache intact. Errors
+            // themselves remain uncached, so the next caller may retry.
+            state.flight = None;
+        }
+        drop(state);
+        guard.disarm();
+        flight.notify.notify_waiters();
+        waiter_outcome
+    }
 }
 
-/// Completion guard for an in-flight build. A `get()` call that is cancelled
-/// or whose build panics drops this mid-build; the guard then resets the
-/// stranded `Slot::Building` back to `Empty` (only if the slot still holds the
-/// SAME flight) and wakes that flight's waiters — with the outcome left
-/// `None`, so waiters loop and start a fresh build rather than hanging on a
-/// dead `Notify` or receiving a fabricated result. On a normal completion
-/// path the builder calls `disarm()` first so the drop is a no-op.
+fn new_flight() -> Arc<Flight> {
+    Arc::new(Flight {
+        notify: Arc::new(Notify::new()),
+        outcome: StdMutex::new(None),
+    })
+}
+
+/// Completion guard for an in-flight build. Cancellation, panic, or dropping an
+/// unpolled detached task clears only its matching flight, preserves the last
+/// successful cache, and wakes waiters so they can retry.
 struct BuildGuard {
-    slot: Arc<StdMutex<Slot>>,
+    state: Arc<StdMutex<CoordinatorState>>,
     flight: Arc<Flight>,
     armed: bool,
 }
 
 impl BuildGuard {
-    fn new(slot: Arc<StdMutex<Slot>>, flight: Arc<Flight>) -> Self {
+    fn new(state: Arc<StdMutex<CoordinatorState>>, flight: Arc<Flight>) -> Self {
         Self {
-            slot,
+            state,
             flight,
             armed: true,
         }
     }
 
-    /// The builder has already updated the slot itself; suppress the reset.
+    /// The builder has already updated the shared state; suppress the reset.
     fn disarm(&mut self) {
         self.armed = false;
     }
@@ -221,12 +312,15 @@ impl Drop for BuildGuard {
             return;
         }
         // A poisoned lock means another thread panicked while holding it; do
-        // not double-panic during unwinding — leave the slot as it is.
-        if let Ok(mut slot) = self.slot.lock()
-            && matches!(&*slot, Slot::Building(current) if Arc::ptr_eq(current, &self.flight))
+        // not double-panic during unwinding — leave the state as it is.
+        if let Ok(mut state) = self.state.lock()
+            && state
+                .flight
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
         {
-            *slot = Slot::Empty;
-            drop(slot);
+            state.flight = None;
+            drop(state);
             // Flight outcome stays `None`: woken waiters observe the drop and
             // loop to retry (a fresh flight) instead of receiving anything
             // fabricate from a build that never completed.
@@ -265,6 +359,14 @@ mod tests {
             version: None,
             order: vec![],
             enabled: BTreeSet::new(),
+        }
+    }
+
+    fn stub_artifacts() -> SnapshotArtifacts {
+        let input = stub_input();
+        SnapshotArtifacts {
+            metrics: Some(MetricsSnapshot::from_input(&input)),
+            dashboard: build_snapshot(&input),
         }
     }
 
@@ -310,6 +412,404 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "zero ttl forces a fresh build"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_nonblocking_read_returns_none_and_starts_one_build() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(StdMutex::new(Some(release_rx)));
+        let build: SnapshotBuildFn = {
+            let calls = calls.clone();
+            let started = started.clone();
+            let release_rx = release_rx.clone();
+            Arc::new(move || {
+                let calls = calls.clone();
+                let started = started.clone();
+                let release_rx = release_rx.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    started.notify_one();
+                    let gate = release_rx
+                        .lock()
+                        .expect("poisoned")
+                        .take()
+                        .expect("build gate taken once");
+                    let _released = gate.await;
+                    Ok(build_snapshot(&stub_input()))
+                })
+            })
+        };
+        let coordinator = SnapshotCoordinator::new(Duration::from_secs(3600), build);
+
+        assert!(coordinator.latest_or_trigger_refresh().is_none());
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("background build never started");
+        assert!(coordinator.latest_or_trigger_refresh().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let _released = release_tx.send(());
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), coordinator.get())
+            .await
+            .expect("background build never completed")
+            .unwrap();
+        let cached = coordinator
+            .latest_or_trigger_refresh()
+            .expect("completed build must be cached");
+        assert!(Arc::ptr_eq(&snapshot, &cached));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn nonblocking_read_serves_fresh_cache_without_refreshing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let coordinator = SnapshotCoordinator::new(
+            Duration::from_secs(3600),
+            counting_source(calls.clone(), Duration::ZERO),
+        );
+
+        let built = coordinator.get().await.unwrap();
+        let cached = coordinator
+            .latest_or_trigger_refresh()
+            .expect("fresh cache must be returned");
+
+        assert!(Arc::ptr_eq(&built, &cached));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(coordinator.state.lock().unwrap().flight.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_nonblocking_reads_share_one_refresh_and_keep_serving_old_cache() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let second_started = Arc::new(Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(StdMutex::new(Some(release_rx)));
+        let build: SnapshotBuildFn = {
+            let calls = calls.clone();
+            let second_started = second_started.clone();
+            let release_rx = release_rx.clone();
+            Arc::new(move || {
+                let calls = calls.clone();
+                let second_started = second_started.clone();
+                let release_rx = release_rx.clone();
+                Box::pin(async move {
+                    let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 1 {
+                        second_started.notify_one();
+                        let gate = release_rx
+                            .lock()
+                            .expect("poisoned")
+                            .take()
+                            .expect("refresh gate taken once");
+                        let _released = gate.await;
+                    }
+                    Ok(build_snapshot(&stub_input()))
+                })
+            })
+        };
+        let coordinator = SnapshotCoordinator::new(Duration::ZERO, build);
+        let old = coordinator.get().await.unwrap();
+
+        let first_stale = coordinator
+            .latest_or_trigger_refresh()
+            .expect("stale cache remains available");
+        assert!(Arc::ptr_eq(&old, &first_stale));
+        tokio::time::timeout(Duration::from_secs(5), second_started.notified())
+            .await
+            .expect("refresh never started");
+
+        for _ in 0..8 {
+            let stale = coordinator
+                .latest_or_trigger_refresh()
+                .expect("all scrapes receive stale cache");
+            assert!(Arc::ptr_eq(&old, &stale));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "refresh must be single-flight"
+        );
+
+        let _released = release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let finished = {
+                    let state = coordinator.state.lock().unwrap();
+                    state.flight.is_none()
+                        && state
+                            .cached
+                            .as_ref()
+                            .is_some_and(|cached| !Arc::ptr_eq(&old, &cached.payload))
+                };
+                if finished {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background refresh never completed");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn dashboard_get_joins_refresh_claimed_by_nonblocking_read() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(StdMutex::new(Some(release_rx)));
+        let build: SnapshotBuildFn = {
+            let calls = calls.clone();
+            let started = started.clone();
+            let release_rx = release_rx.clone();
+            Arc::new(move || {
+                let calls = calls.clone();
+                let started = started.clone();
+                let release_rx = release_rx.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    started.notify_one();
+                    let gate = release_rx
+                        .lock()
+                        .expect("poisoned")
+                        .take()
+                        .expect("build gate taken once");
+                    let _released = gate.await;
+                    Ok(build_snapshot(&stub_input()))
+                })
+            })
+        };
+        let coordinator = SnapshotCoordinator::new(Duration::from_secs(3600), build);
+
+        assert!(coordinator.latest_or_trigger_refresh().is_none());
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("background build never started");
+
+        let mut dashboard = Box::pin(coordinator.get());
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(
+            dashboard.as_mut().poll(&mut cx).is_pending(),
+            "dashboard must wait for the claimed refresh"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let _released = release_tx.send(());
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), dashboard)
+            .await
+            .expect("dashboard waiter never received refresh")
+            .unwrap();
+        let cached = coordinator
+            .latest_or_trigger_refresh()
+            .expect("refresh result must be cached");
+        assert!(Arc::ptr_eq(&snapshot, &cached));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_background_refresh_preserves_last_successful_cache() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let second_started = Arc::new(Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(StdMutex::new(Some(release_rx)));
+        let build: SnapshotArtifactsBuildFn = {
+            let calls = calls.clone();
+            let second_started = second_started.clone();
+            let release_rx = release_rx.clone();
+            Arc::new(move || {
+                let calls = calls.clone();
+                let second_started = second_started.clone();
+                let release_rx = release_rx.clone();
+                Box::pin(async move {
+                    let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 1 {
+                        second_started.notify_one();
+                        let gate = release_rx
+                            .lock()
+                            .expect("poisoned")
+                            .take()
+                            .expect("failure gate taken once");
+                        let _released = gate.await;
+                        return Err("refresh failed".to_string());
+                    }
+                    Ok(stub_artifacts())
+                })
+            })
+        };
+        let coordinator = SnapshotCoordinator::new_with_artifacts(Duration::ZERO, build);
+        let old = coordinator.get().await.unwrap();
+        let old_metrics = coordinator
+            .state
+            .lock()
+            .unwrap()
+            .cached
+            .as_ref()
+            .and_then(|cached| cached.metrics.clone())
+            .expect("successful collection must cache metrics");
+
+        let stale_metrics = coordinator
+            .latest_metrics_or_trigger_refresh()
+            .expect("old metrics must remain available");
+        assert!(Arc::ptr_eq(&old_metrics, &stale_metrics));
+        tokio::time::timeout(Duration::from_secs(5), second_started.notified())
+            .await
+            .expect("failing refresh never started");
+
+        let mut dashboard = Box::pin(coordinator.get());
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(dashboard.as_mut().poll(&mut cx).is_pending());
+        let _released = release_tx.send(());
+        let error = tokio::time::timeout(Duration::from_secs(5), dashboard)
+            .await
+            .expect("dashboard waiter never received refresh error")
+            .unwrap_err();
+        assert_eq!(error, "refresh failed");
+
+        let state = coordinator.state.lock().unwrap();
+        assert!(state.flight.is_none());
+        assert!(
+            state
+                .cached
+                .as_ref()
+                .is_some_and(|cached| Arc::ptr_eq(&old, &cached.payload)),
+            "failed refresh must not discard the last good snapshot"
+        );
+        assert!(
+            state
+                .cached
+                .as_ref()
+                .and_then(|cached| cached.metrics.as_ref())
+                .is_some_and(|metrics| Arc::ptr_eq(&old_metrics, metrics)),
+            "failed refresh must not discard the last good metrics sidecar"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn dropping_unpolled_claimed_build_task_clears_only_its_flight() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let coordinator = SnapshotCoordinator::new(
+            Duration::ZERO,
+            counting_source(calls.clone(), Duration::ZERO),
+        );
+        let old = Arc::new(build_snapshot(&stub_input()));
+        let flight = new_flight();
+        {
+            let mut state = coordinator.state.lock().unwrap();
+            state.cached = Some(CachedSnapshot {
+                payload: old.clone(),
+                metrics: None,
+                built_at: Instant::now(),
+            });
+            state.flight = Some(flight.clone());
+        }
+
+        let task = coordinator.claimed_build_task(flight);
+        drop(task);
+
+        let state = coordinator.state.lock().unwrap();
+        assert!(
+            state.flight.is_none(),
+            "dropped task must release its claim"
+        );
+        assert!(
+            state
+                .cached
+                .as_ref()
+                .is_some_and(|cached| Arc::ptr_eq(&old, &cached.payload)),
+            "guard cleanup must preserve the last good cache"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "task was never polled");
+    }
+
+    #[tokio::test]
+    async fn cancelled_background_refresh_preserves_cached_metrics() {
+        let started = Arc::new(Notify::new());
+        let build: SnapshotArtifactsBuildFn = {
+            let started = started.clone();
+            Arc::new(move || {
+                let started = started.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    std::future::pending::<Result<SnapshotArtifacts, String>>().await
+                })
+            })
+        };
+        let coordinator = SnapshotCoordinator::new_with_artifacts(Duration::ZERO, build);
+        let artifacts = stub_artifacts();
+        let old_payload = Arc::new(artifacts.dashboard);
+        let old_metrics = Arc::new(artifacts.metrics.expect("stub metrics"));
+        let flight = new_flight();
+        {
+            let mut state = coordinator.state.lock().unwrap();
+            state.cached = Some(CachedSnapshot {
+                payload: old_payload.clone(),
+                metrics: Some(old_metrics.clone()),
+                built_at: Instant::now(),
+            });
+            state.flight = Some(flight.clone());
+        }
+
+        let refresh = tokio::spawn(coordinator.claimed_build_task(flight));
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("background refresh never started");
+        refresh.abort();
+        assert!(refresh.await.unwrap_err().is_cancelled());
+
+        let state = coordinator.state.lock().unwrap();
+        assert!(state.flight.is_none());
+        let cached = state.cached.as_ref().expect("old cache must remain");
+        assert!(Arc::ptr_eq(&old_payload, &cached.payload));
+        assert!(
+            cached
+                .metrics
+                .as_ref()
+                .is_some_and(|metrics| Arc::ptr_eq(&old_metrics, metrics))
+        );
+    }
+
+    #[tokio::test]
+    async fn panicked_background_refresh_preserves_cached_metrics() {
+        let build: SnapshotArtifactsBuildFn = Arc::new(|| {
+            Box::pin(async move {
+                panic!("simulated detached refresh panic");
+            })
+        });
+        let coordinator = SnapshotCoordinator::new_with_artifacts(Duration::ZERO, build);
+        let artifacts = stub_artifacts();
+        let old_payload = Arc::new(artifacts.dashboard);
+        let old_metrics = Arc::new(artifacts.metrics.expect("stub metrics"));
+        let flight = new_flight();
+        {
+            let mut state = coordinator.state.lock().unwrap();
+            state.cached = Some(CachedSnapshot {
+                payload: old_payload.clone(),
+                metrics: Some(old_metrics.clone()),
+                built_at: Instant::now(),
+            });
+            state.flight = Some(flight.clone());
+        }
+
+        let join_error = tokio::spawn(coordinator.claimed_build_task(flight))
+            .await
+            .unwrap_err();
+        assert!(join_error.is_panic());
+
+        let state = coordinator.state.lock().unwrap();
+        assert!(state.flight.is_none());
+        let cached = state.cached.as_ref().expect("old cache must remain");
+        assert!(Arc::ptr_eq(&old_payload, &cached.payload));
+        assert!(
+            cached
+                .metrics
+                .as_ref()
+                .is_some_and(|metrics| Arc::ptr_eq(&old_metrics, metrics))
         );
     }
 
@@ -413,7 +913,7 @@ mod tests {
         );
 
         // N waiters join the SAME generation: each first manual poll observes
-        // Building, registers AND enables on the flight under the decision
+        // a flight, registers AND enables on it under the decision
         // guard, then parks — all in that single poll (deterministic seam,
         // no sleeps/yields).
         const N: usize = 4;
@@ -493,9 +993,9 @@ mod tests {
 
     /// Deterministic lost-wakeup regression: completion is forced into the
     /// exact window between the waiter's decision poll and its await poll,
-    /// with zero scheduler races — the test holds the slot lock and the
+    /// with zero scheduler races — the test holds the state lock and the
     /// wakers directly. The waiter's registration MUST be bound to the same
-    /// decision guard that observed `Slot::Building` (not deferred past an
+    /// decision guard that observed an in-flight build (not deferred past an
     /// unlock): `notify_waiters` only reaches already-registered waiters, so
     /// any registration that happens after the decision guard dropped would
     /// miss this completion and hang forever (the timeout catches it).
@@ -505,14 +1005,15 @@ mod tests {
             Duration::from_secs(3600),
             counting_source(Arc::new(AtomicUsize::new(0)), Duration::ZERO),
         );
-        // Place the slot in Building exactly as a real in-flight build would.
-        let flight = Arc::new(Flight {
-            notify: Arc::new(Notify::new()),
-            outcome: StdMutex::new(None),
-        });
-        *coordinator.slot.lock().expect("coordinator poisoned") = Slot::Building(flight.clone());
+        // Install a flight exactly as a real in-flight build would.
+        let flight = new_flight();
+        coordinator
+            .state
+            .lock()
+            .expect("coordinator poisoned")
+            .flight = Some(flight.clone());
 
-        // First poll: decision observes Building and must register+enable the
+        // First poll: decision observes the flight and must register+enable the
         // waiter UNDER the decision guard, before the guard is released.
         let mut waiter = Box::pin(coordinator.get());
         let waker = futures::task::noop_waker();
@@ -523,14 +1024,21 @@ mod tests {
         );
 
         // The build completes in the window after the waiter's decision,
-        // mirroring the real builder: store the flight outcome, swap the slot
-        // to Ready, then fire notify_waiters while the waiter is NOT being
+        // mirroring the real builder: store the flight outcome, publish the
+        // cache and clear the flight, then notify while the waiter is NOT being
         // polled. A waiter whose registration depends on a later lock
         // acquisition would sleep through this wakeup forever.
         let payload = Arc::new(build_snapshot(&stub_input()));
         *flight.outcome.lock().expect("coordinator poisoned") = Some(Ok(payload.clone()));
-        *coordinator.slot.lock().expect("coordinator poisoned") =
-            Slot::Ready(payload.clone(), Instant::now());
+        {
+            let mut state = coordinator.state.lock().expect("coordinator poisoned");
+            state.cached = Some(CachedSnapshot {
+                payload: payload.clone(),
+                metrics: None,
+                built_at: Instant::now(),
+            });
+            state.flight = None;
+        }
         flight.notify.notify_waiters();
 
         // The waiter wakes from the enabled registration and returns the
@@ -542,7 +1050,7 @@ mod tests {
         assert!(Arc::ptr_eq(&payload, &served));
     }
 
-    /// A waiter that observes `Slot::Building` must register its `Notified`
+    /// A waiter that observes an in-flight build must register its `Notified`
     /// before the lock drops, so a builder completing the instant the waiter
     /// unlocks cannot lose the wakeup. Bounding the whole join by a timeout
     /// turns a regression (a waiter hanging on a `Notify` that already fired)
@@ -586,8 +1094,8 @@ mod tests {
         }
     }
 
-    /// When the builder task is cancelled mid-build, the stranded
-    /// `Slot::Building` must reset to `Empty` and wake any waiters, so a later
+    /// When the builder task is cancelled mid-build, the stranded flight must
+    /// be cleared and wake any waiters, so a later
     /// `get()` starts a fresh build instead of hanging on a dead `Notify`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_builder_resets_slot_and_wakes_waiters() {
@@ -641,7 +1149,7 @@ mod tests {
             [waiter.await.unwrap(), fresh.await.unwrap()]
         })
         .await
-        .expect("stranded Building: a get() never resolved within 5s");
+        .expect("stranded flight: a get() never resolved within 5s");
         assert!(outcomes[0].is_ok());
         assert!(outcomes[1].is_ok());
         assert!(
@@ -650,9 +1158,8 @@ mod tests {
         );
     }
 
-    /// A build that panics must reset `Slot::Building` to `Empty` and wake
-    /// waiters, so the next `get()` rebuilds instead of hanging on the panicked
-    /// build's `Notify`.
+    /// A build that panics must clear its flight and wake waiters, so the next
+    /// `get()` rebuilds instead of hanging on the panicked build's `Notify`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn panicked_builder_resets_slot_and_wakes_waiters() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -684,14 +1191,14 @@ mod tests {
             .await
             .expect("builder never started within 5s");
 
-        // The panic (caught by the spawned task) resets the slot.
+        // The panic (caught by the spawned task) clears the flight.
         let join_err = builder.await.unwrap_err();
         assert!(join_err.is_panic(), "expected the build to panic");
 
         // A later get() rebuilds fresh and succeeds within a timeout.
         let retry = tokio::time::timeout(Duration::from_secs(5), coordinator.get())
             .await
-            .expect("stranded Building: retry never resolved within 5s");
+            .expect("stranded flight: retry never resolved within 5s");
         assert!(retry.is_ok());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }

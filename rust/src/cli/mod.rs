@@ -85,7 +85,7 @@ pub enum Commands {
     /// List or focus local and configured remote agent sessions
     Sessions(sessions::SessionsArgs),
 
-    /// Serve usage and cost JSON on 127.0.0.1
+    /// Serve the local dashboard, JSON APIs, and optional Prometheus metrics
     Serve(serve::ServeArgs),
 
     /// Emit a one-shot dashboard snapshot (JSON to stdout or --output file)
