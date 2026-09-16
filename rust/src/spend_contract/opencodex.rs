@@ -80,7 +80,11 @@ fn route_model(model: &str) -> RouteTarget {
 }
 
 fn route_entry(entry: &OpenCodexEntry) -> RouteTarget {
-    if entry.model.trim().contains('/') {
+    // OpenCodex normally records the billing provider separately from the model
+    // namespace. Only the historical OpenAI transport format used the model
+    // prefix as an explicit route; never let another provider's namespace
+    // override its recorded provider.
+    if entry.provider.trim().eq_ignore_ascii_case("openai") && entry.model.trim().contains('/') {
         let routed = route_model(&entry.model);
         if routed != RouteTarget::Unknown {
             return routed;
@@ -340,22 +344,44 @@ fn pricing_model(entry: &OpenCodexEntry) -> Option<String> {
     let target = route_entry(entry);
     let model = entry.model.trim();
     let model_tail = model.split_once('/').map(|(_, tail)| tail).unwrap_or(model);
+    let model_prefix = model.split_once('/').map(|(prefix, _)| prefix);
+    let recorded_provider = entry.provider.trim();
     match target {
-        RouteTarget::Subscription("codex") => Some(
-            if model.contains('/')
-                && model
-                    .split_once('/')
-                    .is_some_and(|(prefix, _)| prefix.eq_ignore_ascii_case("openai"))
-            {
-                model.to_string()
-            } else {
-                model_tail.to_string()
-            },
-        ),
-        RouteTarget::Subscription("opencodego") => Some(format!("opencode/{model_tail}")),
-        RouteTarget::Subscription("kimi") => Some(format!("kimi/{model_tail}")),
-        RouteTarget::Subscription("deepseek") => Some(format!("deepseek/{model_tail}")),
+        RouteTarget::Subscription("codex") => Some(model.to_string()),
+        RouteTarget::Subscription("opencodego") => Some(format!(
+            "opencode/{}",
+            provider_model_id(entry, recorded_provider, model_prefix, model_tail, target)
+        )),
+        RouteTarget::Subscription("kimi") => Some(format!(
+            "kimi/{}",
+            provider_model_id(entry, recorded_provider, model_prefix, model_tail, target)
+        )),
+        RouteTarget::Subscription("deepseek") => Some(format!(
+            "deepseek/{}",
+            provider_model_id(entry, recorded_provider, model_prefix, model_tail, target)
+        )),
         RouteTarget::Subscription(_) | RouteTarget::TokenOnly | RouteTarget::Unknown => None,
+    }
+}
+
+fn provider_model_id(
+    entry: &OpenCodexEntry,
+    recorded_provider: &str,
+    model_prefix: Option<&str>,
+    model_tail: &str,
+    target: RouteTarget,
+) -> String {
+    let prefix_matches_recorded_provider = model_prefix.is_some_and(|prefix| {
+        prefix.eq_ignore_ascii_case(recorded_provider)
+            || (recorded_provider.eq_ignore_ascii_case("kimi-for-coding")
+                && prefix.eq_ignore_ascii_case("kimi-coding"))
+    });
+    let is_legacy_openai_route =
+        recorded_provider.eq_ignore_ascii_case("openai") && route_model(&entry.model) == target;
+    if prefix_matches_recorded_provider || is_legacy_openai_route {
+        model_tail.to_string()
+    } else {
+        entry.model.trim().to_string()
     }
 }
 
@@ -645,14 +671,26 @@ mod tests {
     }
 
     #[test]
-    fn model_prefix_wins_over_mismatched_provider_label() {
+    fn recorded_provider_wins_over_mismatched_model_namespace() {
+        assert_eq!(
+            route_entry(&entry("opencode-go", "openai/gpt-5.6-sol")),
+            RouteTarget::Subscription("opencodego")
+        );
+        assert_eq!(
+            route_entry(&entry("deepseek", "openai/gpt-5.6-sol")),
+            RouteTarget::Subscription("deepseek")
+        );
+    }
+
+    #[test]
+    fn legacy_openai_transport_still_uses_explicit_route() {
         assert_eq!(
             route_entry(&entry("openai", "opencode-go/deepseek-v4-flash")),
             RouteTarget::Subscription("opencodego")
         );
         assert_eq!(
-            route_entry(&entry("opencode-go", "openai/gpt-5.6-sol")),
-            RouteTarget::Subscription("codex")
+            pricing_model(&entry("openai", "opencode-go/gpt-5")),
+            Some("opencode/gpt-5".to_string())
         );
     }
 
@@ -669,6 +707,27 @@ mod tests {
         assert_eq!(
             pricing_model(&entry("deepseek", "deepseek-chat")).as_deref(),
             Some("deepseek/deepseek-chat")
+        );
+        assert_eq!(
+            pricing_model(&entry("opencode-go", "openai/gpt-5")),
+            Some("opencode/openai/gpt-5".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_provider_or_namespace_fails_closed_for_routing_and_pricing() {
+        assert_eq!(
+            route_entry(&entry("private-proxy", "openai/gpt-5")),
+            RouteTarget::Unknown
+        );
+        assert_eq!(pricing_model(&entry("private-proxy", "openai/gpt-5")), None);
+        assert_eq!(
+            route_entry(&entry("openai", "/gpt-5")),
+            RouteTarget::Subscription("codex")
+        );
+        assert_eq!(
+            pricing_model(&entry("openai", "/gpt-5")),
+            Some("/gpt-5".to_string())
         );
     }
 
