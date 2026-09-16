@@ -198,6 +198,8 @@ struct ClaudeEvent {
     timestamp: Option<String>,
     #[serde(rename = "requestId", alias = "request_id")]
     request_id: Option<String>,
+    #[serde(rename = "sessionId", alias = "session_id")]
+    session_id: Option<String>,
     message: Option<ClaudeMessage>,
     #[serde(flatten)]
     extra: HashMap<String, Value>,
@@ -209,6 +211,17 @@ impl ClaudeEvent {
         DateTime::parse_from_rfc3339(timestamp)
             .ok()
             .map(|ts| ts.with_timezone(&Utc))
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        self.session_id
+            .as_deref()
+            .or_else(|| session_id_from_entries(self.extra.iter()))
+            .or_else(|| {
+                self.message
+                    .as_ref()
+                    .and_then(|message| session_id_from_entries(message.extra.iter()))
+            })
     }
 
     fn is_vertex_ai_usage_entry(&self) -> bool {
@@ -243,6 +256,30 @@ impl ClaudeEvent {
             .as_ref()
             .is_some_and(ClaudeMessage::contains_vertex_metadata)
     }
+}
+
+fn session_id_from_entries<'a, I>(entries: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = (&'a String, &'a Value)>,
+{
+    let mut metadata = None;
+    for (key, value) in entries {
+        if key == "sessionId" || key == "session_id" {
+            if let Some(session_id) = value.as_str() {
+                return Some(session_id);
+            }
+        } else if key == "metadata" {
+            metadata = Some(value);
+        }
+    }
+    metadata.and_then(session_id_from_value)
+}
+
+fn session_id_from_value(value: &Value) -> Option<&str> {
+    let Value::Object(entries) = value else {
+        return None;
+    };
+    session_id_from_entries(entries.iter())
 }
 
 #[derive(Debug, Deserialize)]
@@ -385,12 +422,24 @@ struct ClaudeUsageRecord {
     model: String,
     pricing_known: bool,
     timestamp: Option<DateTime<Utc>>,
-    dedup_key: Option<String>,
+    dedup_key: Option<ClaudeUsageDedupKey>,
     input: u64,
     output: u64,
     cache_create: u64,
     cache_read: u64,
     cost: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ClaudeUsageDedupKey {
+    Request {
+        message_id: String,
+        request_id: String,
+    },
+    Session {
+        session_id: String,
+        message_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -574,7 +623,7 @@ impl CostScanner {
 fn for_each_claude_usage_record<F>(
     path: &Path,
     cutoff: &DateTime<Utc>,
-    seen: &mut HashSet<String>,
+    seen: &mut HashSet<ClaudeUsageDedupKey>,
     cancel: Option<&AtomicBool>,
     on_record: F,
 ) -> usize
@@ -588,7 +637,7 @@ where
 fn for_each_claude_usage_record_with_pricing<F>(
     path: &Path,
     cutoff: &DateTime<Utc>,
-    seen: &mut HashSet<String>,
+    seen: &mut HashSet<ClaudeUsageDedupKey>,
     cancel: Option<&AtomicBool>,
     pricing: &mut ClaudeScanPricingResolver,
     mut on_record: F,
@@ -690,7 +739,11 @@ fn claude_usage_record_from_event_with_pricing(
         model: model.to_string(),
         pricing_known,
         timestamp: event.parsed_timestamp(),
-        dedup_key: claude_usage_dedup_key(message.id.as_deref(), event.request_id.as_deref()),
+        dedup_key: claude_usage_dedup_key(
+            message.id.as_deref(),
+            event.request_id.as_deref(),
+            event.session_id(),
+        ),
         input,
         output,
         cache_create,
@@ -699,19 +752,31 @@ fn claude_usage_record_from_event_with_pricing(
     })
 }
 
-fn claude_usage_dedup_key(message_id: Option<&str>, request_id: Option<&str>) -> Option<String> {
-    match (message_id, request_id) {
-        (Some(message_id), Some(request_id)) => Some(format!("{message_id}:{request_id}")),
-        (Some(message_id), None) => Some(format!("message:{message_id}")),
-        (None, Some(request_id)) => Some(format!("request:{request_id}")),
-        (None, None) => None,
+fn claude_usage_dedup_key(
+    message_id: Option<&str>,
+    request_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Option<ClaudeUsageDedupKey> {
+    let message_id = message_id.filter(|message_id| !message_id.trim().is_empty())?;
+    let request_id = request_id.filter(|request_id| !request_id.trim().is_empty());
+    if let Some(request_id) = request_id {
+        return Some(ClaudeUsageDedupKey::Request {
+            message_id: message_id.to_string(),
+            request_id: request_id.to_string(),
+        });
     }
+
+    let session_id = session_id.filter(|session_id| !session_id.trim().is_empty())?;
+    Some(ClaudeUsageDedupKey::Session {
+        session_id: session_id.to_string(),
+        message_id: message_id.to_string(),
+    })
 }
 
 fn should_count_claude_record(
     record: &ClaudeUsageRecord,
     cutoff: &DateTime<Utc>,
-    seen: &mut HashSet<String>,
+    seen: &mut HashSet<ClaudeUsageDedupKey>,
 ) -> bool {
     if let Some(timestamp) = record.timestamp
         && timestamp < *cutoff

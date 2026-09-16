@@ -263,18 +263,70 @@ fn scans_gpt6_astra_usage_with_cached_and_reasoning_tokens() {
 #[test]
 fn derives_claude_dedup_key_from_message_and_request_ids() {
     assert_eq!(
-        claude_usage_dedup_key(Some("msg_1"), Some("req_1")).as_deref(),
-        Some("msg_1:req_1")
+        claude_usage_dedup_key(Some("msg_1"), Some("req_1"), None),
+        Some(ClaudeUsageDedupKey::Request {
+            message_id: "msg_1".to_string(),
+            request_id: "req_1".to_string(),
+        })
     );
     assert_eq!(
-        claude_usage_dedup_key(Some("msg_1"), None).as_deref(),
-        Some("message:msg_1")
+        claude_usage_dedup_key(Some("msg_1"), None, Some("session_1")),
+        Some(ClaudeUsageDedupKey::Session {
+            session_id: "session_1".to_string(),
+            message_id: "msg_1".to_string(),
+        })
+    );
+    assert_eq!(claude_usage_dedup_key(Some("msg_1"), None, None), None);
+    assert_eq!(
+        claude_usage_dedup_key(None, Some("req_1"), Some("session_1")),
+        None
     );
     assert_eq!(
-        claude_usage_dedup_key(None, Some("req_1")).as_deref(),
-        Some("request:req_1")
+        claude_usage_dedup_key(Some("msg_1"), Some(" "), Some("session_1")),
+        Some(ClaudeUsageDedupKey::Session {
+            session_id: "session_1".to_string(),
+            message_id: "msg_1".to_string(),
+        })
     );
-    assert_eq!(claude_usage_dedup_key(None, None), None);
+    assert_eq!(
+        claude_usage_dedup_key(Some(" "), None, Some("session_1")),
+        None
+    );
+    assert_eq!(claude_usage_dedup_key(Some("msg_1"), None, Some(" ")), None);
+}
+
+#[test]
+fn session_aware_claude_dedup_keeps_distinct_sessions_separate() {
+    let first: ClaudeEvent = serde_json::from_str(
+        r#"{"type":"assistant","sessionId":"session_a","message":{"id":"msg_1","model":"claude-sonnet-4-6","usage":{"input_tokens":10}}}"#,
+    )
+    .unwrap();
+    let second: ClaudeEvent = serde_json::from_str(
+        r#"{"type":"assistant","sessionId":"session_b","message":{"id":"msg_1","model":"claude-sonnet-4-6","usage":{"input_tokens":10}}}"#,
+    )
+    .unwrap();
+    let first_record = claude_usage_record_from_event(&first).expect("first usage record");
+    let second_record = claude_usage_record_from_event(&second).expect("second usage record");
+    let cutoff = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut seen = HashSet::new();
+
+    assert!(should_count_claude_record(
+        &first_record,
+        &cutoff,
+        &mut seen
+    ));
+    assert!(should_count_claude_record(
+        &second_record,
+        &cutoff,
+        &mut seen
+    ));
+    assert!(!should_count_claude_record(
+        &first_record,
+        &cutoff,
+        &mut seen
+    ));
 }
 
 #[test]
