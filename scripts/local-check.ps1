@@ -39,6 +39,7 @@ function Invoke-Step {
 if ($Slice -eq 'ci') {
     Push-Location $RepoRoot
     try {
+        Invoke-Step "CircleCI helper tests" "powershell.exe" @("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "scripts\circleci-pr.tests.ps1")
         Invoke-Step "Rust format check" "cargo" @("fmt", "--all", "--check")
         Invoke-Step "Rust clippy (workspace)" "cargo" @("clippy", "--workspace", "--all-targets", "--", "-D", "warnings")
         Invoke-Step "Rust tests (workspace)" "cargo" @("test", "--workspace")

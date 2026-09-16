@@ -93,6 +93,15 @@ fn automatic_window(
     snapshot: &ProviderUsageSnapshot,
     provider: Option<ProviderId>,
 ) -> Option<RateWindowSnapshot> {
+    // Cursor's Auto usage is the monthly included allowance, surfaced by the
+    // provider in the semantic secondary slot. Do not let a higher percentage
+    // in the aggregate or API slot change which quota Automatic represents.
+    if provider == Some(ProviderId::Cursor)
+        && let Some(semantic_monthly) = non_informational(snapshot.secondary.as_ref())
+    {
+        return Some(semantic_monthly.clone());
+    }
+
     if provider == Some(ProviderId::Claude) {
         let weekly = non_informational(snapshot.secondary.as_ref());
         if let (Some(model), Some(weekly)) = (snapshot.model_specific.as_ref(), weekly) {
@@ -147,6 +156,15 @@ fn automatic_metric_policy(provider: Option<ProviderId>) -> AutomaticMetricPolic
         Some(ProviderId::Antigravity) => AutomaticMetricPolicy {
             prefers_available_window: true,
             prioritizes_exhausted_window: false,
+            uses_extra_windows: false,
+        },
+        // Cursor's monthly Auto lane is the semantic weekly pace. Grok Bot is
+        // a named extra allowance and must stay available through the explicit
+        // ExtraUsage preference without changing the automatic bar.
+        Some(ProviderId::Cursor) => AutomaticMetricPolicy {
+            prefers_available_window: false,
+            prioritizes_exhausted_window: codexbar::core::instantiate_provider(ProviderId::Cursor)
+                .automatic_metric_prioritizes_exhausted_window(),
             uses_extra_windows: false,
         },
         Some(id) => AutomaticMetricPolicy {
@@ -329,6 +347,31 @@ mod tests {
         assert_eq!(
             selected_usage_window(&snapshot, &Settings::default()).used_percent,
             60.0
+        );
+    }
+
+    #[test]
+    fn cursor_automatic_uses_semantic_monthly_lane_and_keeps_grok_bot_explicit() {
+        let mut snapshot = snapshot();
+        snapshot.provider_id = "cursor".to_string();
+        snapshot.primary = window(85.0);
+        snapshot.secondary = Some(window(20.0));
+        snapshot.extra_rate_windows = vec![crate::commands::NamedRateWindowSnapshot {
+            id: "cursor-grok-bot".to_string(),
+            title: "Grok Bot".to_string(),
+            window: window(95.0),
+        }];
+
+        assert_eq!(
+            selected_usage_window(&snapshot, &Settings::default()).used_percent,
+            20.0
+        );
+
+        let mut settings = Settings::default();
+        settings.set_provider_metric(ProviderId::Cursor, MetricPreference::ExtraUsage);
+        assert_eq!(
+            selected_usage_window(&snapshot, &settings).used_percent,
+            95.0
         );
     }
 

@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     This script is the only release publisher. It requires GH_TOKEN from the
-    restricted CircleCI context, creates a draft release when needed, compares
+    restricted release workflow context, creates a draft release when needed, compares
     every existing asset by SHA-256, and uploads only missing assets. A mismatch
     or a non-draft release is a hard failure. The script never changes draft to
     published and is safe to rerun after a partial upload.
@@ -15,6 +15,7 @@
 param(
     [Parameter(Mandatory)][string]$AssetsDir,
     [Parameter(Mandatory)][string]$Tag,
+    [Parameter(Mandatory)][string]$Sha,
     [string]$Repository = 'nesszer/Win-CodexBar'
 )
 
@@ -108,7 +109,7 @@ function New-DraftRelease {
     return Invoke-GhJson @(
         'api', '--method', 'POST', "repos/$Repository/releases",
         '--field', "tag_name=$Tag",
-        '--field', "target_commitish=$env:RELEASE_SHA",
+        '--field', "target_commitish=$($Sha.ToLowerInvariant())",
         '--field', "name=$Tag",
         '--field', 'draft=true',
         '--field', 'prerelease=false',
@@ -158,15 +159,12 @@ function Assert-ManifestAndAssets {
     if (-not $manifest.PSObject.Properties['version'] -or [string]$manifest.version -ne $ExpectedVersion) {
         throw "Manifest version does not match $ExpectedVersion."
     }
-    if (-not $env:CIRCLE_SHA1 -or $env:CIRCLE_SHA1 -notmatch '^[0-9a-fA-F]{40}$') {
-        throw 'CIRCLE_SHA1 must be a full commit SHA in the publisher job.'
+    if ($Sha -notmatch '^[0-9a-fA-F]{40}$') {
+        throw 'Sha must be a full commit SHA in the publisher job.'
     }
-    $expectedCommit = ($env:CIRCLE_SHA1).ToLowerInvariant()
+    $expectedCommit = $Sha.ToLowerInvariant()
     if (-not $manifest.PSObject.Properties['commit'] -or [string]$manifest.commit -cne $expectedCommit) {
-        throw "Manifest commit must equal lowercase CIRCLE_SHA1 ($expectedCommit)."
-    }
-    if (-not $env:RELEASE_SHA -or $env:RELEASE_SHA -notmatch '^[0-9a-fA-F]{40}$' -or ($env:RELEASE_SHA).ToLowerInvariant() -ne $expectedCommit) {
-        throw 'RELEASE_SHA must equal lowercase CIRCLE_SHA1 before publication.'
+        throw "Manifest commit must equal the immutable release SHA ($expectedCommit)."
     }
 
     $expectedNames = @(Get-RequiredReleaseAssets $ExpectedVersion | Sort-Object)
@@ -180,6 +178,14 @@ function Assert-ManifestAndAssets {
     $manifestNames = @($manifestAssets | ForEach-Object { [string]$_.name } | Sort-Object)
     if (($manifestNames -join '|') -ne ($expectedNames -join '|')) {
         throw "Manifest assets must be exactly: $($expectedNames -join ', ')."
+    }
+
+    $assetsRoot = (Get-Item -LiteralPath $AssetsDir).FullName.TrimEnd('\', '/')
+    $nestedFiles = @(Get-ChildItem -LiteralPath $assetsRoot -Recurse -File | Where-Object {
+        $_.Directory.FullName.TrimEnd('\', '/') -ne $assetsRoot
+    })
+    if ($nestedFiles.Count -ne 0) {
+        throw "Persisted bundle contains unexpected nested files: $($nestedFiles.FullName -join ', ')."
     }
 
     $publishFiles = @(Get-ChildItem -LiteralPath $AssetsDir -File | Where-Object {
@@ -211,13 +217,16 @@ function Assert-ManifestAndAssets {
 
 $env:GH_TOKEN = if ($env:GH_TOKEN) { $env:GH_TOKEN } elseif ($env:gh_token) { $env:gh_token } else { '' }
 if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
-    throw 'GH_TOKEN is required and must be provided only by the restricted CircleCI publisher context.'
+    throw 'GH_TOKEN is required and must be provided only by the restricted release publisher context.'
 }
 if (-not (Test-CanonicalReleaseTag $Tag)) {
     throw "Publisher accepts only canonical vX.Y.Z tags; received '$Tag'."
 }
 if ((Normalize-GitHubRepository $Repository) -ne 'nesszer/win-codexbar') {
     throw "Publisher repository must be canonical nesszer/Win-CodexBar."
+}
+if ($Sha -notmatch '^[0-9a-fA-F]{40}$') {
+    throw "Publisher requires a full immutable commit SHA; received '$Sha'."
 }
 if (-not (Test-Path -LiteralPath $AssetsDir -PathType Container)) {
     throw "Missing persisted release assets directory: $AssetsDir"
@@ -228,9 +237,6 @@ Assert-ManifestAndAssets (Join-Path $AssetsDir 'release-manifest.json') $version
 
 $release = Get-Release
 if ($null -eq $release) {
-    if (-not $env:RELEASE_SHA -or $env:RELEASE_SHA -notmatch '^[0-9a-fA-F]{40}$') {
-        throw 'RELEASE_SHA must be a full commit SHA when creating a draft release.'
-    }
     Write-Host "Creating draft GitHub Release $Tag"
     $release = New-DraftRelease
 }

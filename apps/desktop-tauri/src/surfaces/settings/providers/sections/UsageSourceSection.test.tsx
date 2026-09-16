@@ -23,6 +23,13 @@ describe("usage source policy", () => {
       "cli",
       "web",
     ]);
+    expect(usageSourcePolicy("antigravity")?.options.map((option) => option.value)).toEqual([
+      "auto",
+      "cli",
+    ]);
+    expect(usageSourcePolicy("antigravity")?.options[0].description).toContain(
+      "skips agy reports without account identity",
+    );
     expect(shouldShowCookieSource("alibabatokenplan", "cli")).toBe(false);
     expect(shouldShowCookieSource("alibabatokenplan", "auto")).toBe(true);
     expect(shouldShowCookieSource("codex", "cli")).toBe(true);

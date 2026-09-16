@@ -78,5 +78,46 @@ Assert-True ($builderText -notmatch $legacySwitch) 'legacy upload parameter remo
 Assert-True ($builderText -notmatch $clobberFlag) 'builder has no clobber upload path'
 $publisherText = Get-Content -Raw -LiteralPath (Join-Path $scriptRoot 'publish-github-release.ps1')
 Assert-True ($publisherText -notmatch $clobberFlag) 'publisher has no clobber flag'
+Assert-True ($publisherText -match '\[Parameter\(Mandatory\)\]\[string\]\$Sha') 'publisher requires an explicit immutable SHA'
+Assert-True ($publisherText -notmatch 'CIRCLE_SHA1|RELEASE_SHA') 'publisher has no CircleCI SHA dependency'
+
+$artifactConfigText = Get-Content -Raw -LiteralPath (Join-Path $scriptRoot '..\.signpath\artifact-configuration.xml')
+Assert-True ($artifactConfigText -match '<pe-file path="CodexBar-\$\{version\}-Setup\.exe"') 'SignPath config signs installer'
+Assert-True ($artifactConfigText -match '<pe-file path="CodexBar-\$\{version\}-portable\.exe"') 'SignPath config signs portable executable'
+Assert-True ($artifactConfigText -match '<zip-file path="CodexBarCLI-v\$\{version\}-windows-x64\.zip"') 'SignPath config opens the CLI ZIP'
+Assert-True ($artifactConfigText -match '<pe-file path="codexbar-cli\.exe"') 'SignPath config signs nested CLI executable'
+
+$finalizerText = Get-Content -Raw -LiteralPath (Join-Path $scriptRoot 'finalize-signed-release.ps1')
+Assert-True ($finalizerText -match 'Get-AuthenticodeSignature') 'finalizer verifies Authenticode'
+Assert-True ($finalizerText -match 'ExpectedSignerThumbprint') 'finalizer can enforce the issued signer certificate'
+Assert-True ($finalizerText -match 'Expand-Archive') 'finalizer inspects nested CLI archive'
+Assert-True ($finalizerText -match 'codexbar-cli\.exe at its root') 'finalizer enforces the configured CLI archive path'
+Assert-True ($finalizerText -match 'CLI ZIP must contain exactly one file') 'finalizer rejects extra CLI archive files'
+Assert-True ($finalizerText -match 'Invoke-ManifestEmission -AssetsDir \$finalAssetsDir') 'finalizer emits manifest from signed-only assets'
+Assert-True ($finalizerText -notmatch '\$BuildOutputDir|keeping unsigned|fallback') 'finalizer has no unsigned fallback'
+Assert-True ($publisherText -match 'unexpected nested files') 'publisher rejects nested final-bundle files'
+
+$releaseWorkflowText = Get-Content -Raw -LiteralPath (Join-Path $scriptRoot '..\.github\workflows\release.yml')
+Assert-True ($releaseWorkflowText -match 'signpath/github-action-submit-signing-request@v3') 'production workflow uses current SignPath action'
+Assert-True ($releaseWorkflowText -match 'actions/upload-artifact@v4') 'production workflow uploads a GitHub artifact'
+Assert-True ($releaseWorkflowText -match 'signing-policy-slug: release-signing') 'production workflow pins release-signing'
+Assert-True ($releaseWorkflowText -match 'CodexBarCLI-v\$version-windows-x64\.zip') 'production workflow includes the CLI ZIP'
+Assert-True ($releaseWorkflowText -match 'finalize-signed-release\.ps1') 'production workflow runs signed finalization'
+Assert-True ($releaseWorkflowText -match 'actions/download-artifact@v4') 'production workflow transfers only the verified bundle to publisher'
+Assert-True ($releaseWorkflowText -match 'contents: write') 'production publisher has release write permission'
+Assert-True ($releaseWorkflowText -match 'SIGNPATH_RELEASE_CERT_THUMBPRINT') 'production workflow requires the issued certificate thumbprint'
+Assert-True ($releaseWorkflowText -match [regex]::Escape('ref: ${{ needs.sign.outputs.sha }}')) 'publisher checks out the immutable signed SHA'
+Assert-True ($releaseWorkflowText -notmatch 'trigger-circleci|if:.*SIGNPATH_API_TOKEN') 'production workflow cannot skip SignPath or delegate to CircleCI'
+
+$testWorkflowText = Get-Content -Raw -LiteralPath (Join-Path $scriptRoot '..\.github\workflows\signpath-test.yml')
+Assert-True ($testWorkflowText -match 'workflow_dispatch') 'SignPath test is manually dispatched'
+Assert-True ($testWorkflowText -match 'signing-policy-slug: test-signing') 'SignPath test pins test-signing'
+Assert-True ($testWorkflowText -match 'source_ref:') 'SignPath test builds a reviewed workflow source ref'
+Assert-True ($testWorkflowText -match 'AllowTagSourceMismatch') 'SignPath test separates version label from source commit'
+Assert-True ($testWorkflowText -notmatch 'gh release create|Publish draft') 'SignPath test cannot publish a release'
+
+$circleConfigText = Get-Content -Raw -LiteralPath (Join-Path $scriptRoot '..\.circleci\config.yml')
+Assert-True ($circleConfigText -notmatch 'release-build|release-publish|release-approval') 'CircleCI has no tag release jobs'
+Assert-True ($circleConfigText -notmatch '(?ms)^  release:\s*$') 'CircleCI has no tag release workflow'
 
 Write-Host 'Release pipeline focused tests passed.'

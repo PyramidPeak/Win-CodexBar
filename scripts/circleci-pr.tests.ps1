@@ -89,4 +89,8 @@ Assert-True ($decision.Reason -match 'codex/topic') 'topic branch skip reason'
 $decision = Get-TriggerGateDecision -BudgetMode 'off' -Branch 'main' -PrUrl ''
 Assert-True $decision.Skip 'budget off wins over main push'
 
+Write-Host '==> Hosted Node provisioning guard'
+$prRunnerText = Get-Content -Raw -LiteralPath (Join-Path $scriptRoot 'run-circleci-pr-check.ps1')
+Assert-True ($prRunnerText -match '\$installedNodeVersion\s*=\s*\$imageNodeVersion') 'Node status is initialized when the hosted image already has the required major'
+
 Write-Host 'CircleCI focused tests passed.'

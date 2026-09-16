@@ -26,6 +26,20 @@ const POLICIES: Readonly<Record<string, UsageSourcePolicy>> = {
     ],
     hideCookieSourceValues: ["cli"],
   },
+  antigravity: {
+    options: [
+      {
+        value: "auto",
+        label: "Auto",
+        description: "Auto skips agy reports without account identity for selected or injected Google accounts. Try Local API / agy CLI to use the local app or agy's signed-in account, which may differ.",
+      },
+      {
+        value: "cli",
+        label: "Local API / agy CLI",
+        description: "Uses the local Antigravity app or agy's signed-in account, which may differ from the selected Google account.",
+      },
+    ],
+  },
 };
 
 export function usageSourcePolicy(providerId: string): UsageSourcePolicy | null {

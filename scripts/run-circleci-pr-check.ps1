@@ -90,6 +90,9 @@ try {
     $nodeDir = ''
     $imageNodeVersion = $null
     if (Get-Command node -ErrorAction SilentlyContinue) { $imageNodeVersion = (& node --version).Trim() }
+    # Keep the image version available when the hosted image already provides
+    # the required major and no MSI installation is needed.
+    $installedNodeVersion = $imageNodeVersion
     $activeNodeMajor = 0
     if ($imageNodeVersion -match '^v(\d+)\.') { $activeNodeMajor = [int]$Matches[1] }
     if ($activeNodeMajor -ne $NodeMajor) {

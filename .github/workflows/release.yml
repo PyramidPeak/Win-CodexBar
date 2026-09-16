@@ -5,37 +5,237 @@ on:
     tags:
       - 'v*.*.*'
 
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  trigger-circleci:
-    name: Trigger CircleCI release pipeline
-    runs-on: ubuntu-latest
+  sign:
+    name: Build and sign
+    runs-on: windows-latest
+    timeout-minutes: 240
     permissions:
+      actions: read
       contents: read
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
 
     steps:
-      - name: Trigger CircleCI pipeline
-        env:
-          CIRCLECI_API_TOKEN: ${{ secrets.CIRCLECI_API_TOKEN }}
+      - name: Checkout exact release tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Resolve immutable release identity
+        id: release
+        shell: pwsh
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          CIRCLECI_ORG_ID="abf39f4e-76e2-4992-a38e-faa68f1f232c"
-          CIRCLECI_PROJECT_ID="625e45a1-5a14-45f5-b4f8-516cd065ff53"
-          CIRCLECI_PIPELINE_DEFINITION_ID="1818f88e-272d-43d0-b1a4-92a28f2e14ad"
-          CIRCLECI_PROJECT_SLUG="circleci/NEXu54nDSfmgyJzxZ94jPH/D9XGye15Fdwi1TbFiykFTY"
-          echo "Triggering CircleCI pipeline for tag $TAG..."
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-            "https://circleci.com/api/v2/project/circleci/$CIRCLECI_ORG_ID/$CIRCLECI_PROJECT_ID/pipeline/run" \
-            -H "Circle-Token: $CIRCLECI_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"definition_id\":\"$CIRCLECI_PIPELINE_DEFINITION_ID\",\"config\":{\"tag\":\"$TAG\"},\"checkout\":{\"tag\":\"$TAG\"}}")
-          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-          BODY=$(echo "$RESPONSE" | head -n -1)
-          echo "HTTP Status: $HTTP_CODE"
-          echo "Response: $BODY"
-          if [ "$HTTP_CODE" != "201" ]; then
-            echo "Failed to trigger CircleCI pipeline"
-            exit 1
-          fi
-          PIPELINE_ID=$(echo "$BODY" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-          echo "CircleCI pipeline triggered: https://app.circleci.com/pipelines/$CIRCLECI_PROJECT_SLUG/$PIPELINE_ID"
-          echo "::notice::CircleCI pipeline triggered for $TAG"
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          if (-not ($tag -match '^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$')) {
+            throw "Release workflow accepts only canonical vX.Y.Z tags; received '$tag'."
+          }
+          $head = (& git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve checked-out HEAD.' }
+          $tagSha = (& git rev-parse --verify "$tag^{commit}").Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0) { throw "Could not resolve release tag '$tag'." }
+          if ($head -ne $tagSha) {
+            throw "Checked-out HEAD '$head' does not equal tag '$tag' commit '$tagSha'."
+          }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha=$head" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "version=$($tag.Substring(1))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "[ok] immutable release identity: $tag ($head)"
+
+      - name: Release preflight
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/release-preflight.ps1 -Tag $env:RELEASE_TAG -Sha $env:RELEASE_SHA -RepoRoot .
+          if ($LASTEXITCODE -ne 0) { throw "release-preflight failed: $LASTEXITCODE" }
+
+      - name: Verify SignPath production configuration
+        shell: pwsh
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_RELEASE_CERT_THUMBPRINT: ${{ vars.SIGNPATH_RELEASE_CERT_THUMBPRINT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @('SIGNPATH_API_TOKEN', 'SIGNPATH_RELEASE_CERT_THUMBPRINT')) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ([string]::IsNullOrWhiteSpace($value)) {
+              throw "$name is required; refusing to build or publish an unsigned release."
+            }
+          }
+          Write-Host '[ok] required SignPath production credentials are present'
+
+      - name: Install release prerequisites
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/install-release-prerequisites.ps1 -RepoRoot .
+          if ($LASTEXITCODE -ne 0) { throw "install-release-prerequisites failed: $LASTEXITCODE" }
+
+      - name: Build unsigned release artifacts
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/circleci-release-build.ps1 -Tag $env:RELEASE_TAG -Sha $env:RELEASE_SHA -RepoRoot . -OutputDir release-output
+          if ($LASTEXITCODE -ne 0) { throw "release build failed: $LASTEXITCODE" }
+
+      - name: Prepare exact SignPath input bundle
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inputDir = Join-Path (Get-Location) 'signing-input'
+          if (Test-Path -LiteralPath $inputDir) {
+            throw "Refusing to reuse signing input directory: $inputDir"
+          }
+          New-Item -ItemType Directory -Force -Path $inputDir | Out-Null
+          $version = $env:RELEASE_VERSION
+          $names = @(
+            "CodexBar-$version-Setup.exe",
+            "CodexBar-$version-portable.exe",
+            "CodexBarCLI-v$version-windows-x64.zip"
+          )
+          foreach ($name in $names) {
+            $source = Join-Path (Get-Location) "release-output\$name"
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+              throw "Build output is missing the SignPath input asset: $source"
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $inputDir $name)
+          }
+          $files = @(Get-ChildItem -LiteralPath $inputDir -File | Select-Object -ExpandProperty Name | Sort-Object)
+          if (($files -join '|') -ne (($names | Sort-Object) -join '|')) {
+            throw "SignPath input must contain exactly three top-level files; found $($files -join ', ')."
+          }
+          Write-Host "[ok] SignPath input bundle contains exactly: $($files -join ', ')"
+
+      - name: Upload unsigned artifact for signing
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: codexbar-signing-input-${{ steps.release.outputs.tag }}
+          path: signing-input
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Verify GitHub access required by SignPath
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.upload-unsigned.outputs.artifact-id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $jobsEndpoint = "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID/jobs"
+          gh api $jobsEndpoint --silent
+          if ($LASTEXITCODE -ne 0) { throw "GITHUB_TOKEN cannot read workflow jobs." }
+
+          $artifactEndpoint = "repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:ARTIFACT_ID"
+          gh api $artifactEndpoint --silent
+          if ($LASTEXITCODE -ne 0) { throw "GITHUB_TOKEN cannot read artifact metadata." }
+
+          $headers = Join-Path $env:RUNNER_TEMP 'signpath-artifact-download-headers.txt'
+          curl.exe -sS --max-redirs 0 -D $headers -o NUL `
+            -H "Authorization: Bearer $env:GH_TOKEN" `
+            -H 'Accept: application/vnd.github+json' `
+            "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:ARTIFACT_ID/zip"
+          if ($LASTEXITCODE -ne 0) { throw "GITHUB_TOKEN artifact download probe failed." }
+
+          $status = Get-Content -LiteralPath $headers -First 1
+          if ($status -notmatch '\s302\s') {
+            throw "GITHUB_TOKEN cannot obtain artifact download redirect: $status"
+          }
+          Write-Host '[ok] GITHUB_TOKEN can read workflow jobs, artifact metadata, and artifact download'
+
+      - name: Submit production signing request
+        id: signpath
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: 9f67194d-974c-4e9c-bac7-20248e8b6c39
+          project-slug: Win-CodexBar
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: codexbar-installer
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: release-signed
+          parameters: |
+            version: "${{ steps.release.outputs.version }}"
+
+      - name: Verify signed output and create final bundle
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          SIGNPATH_RELEASE_CERT_THUMBPRINT: ${{ vars.SIGNPATH_RELEASE_CERT_THUMBPRINT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/finalize-signed-release.ps1 -SignedOutputDir release-signed -FinalOutputDir release-final-output -Tag $env:RELEASE_TAG -Sha $env:RELEASE_SHA -ExpectedSignerThumbprint $env:SIGNPATH_RELEASE_CERT_THUMBPRINT -Repository 'nesszer/Win-CodexBar'
+          if ($LASTEXITCODE -ne 0) { throw "signed release finalization failed: $LASTEXITCODE" }
+
+      - name: Retain verified signed bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: codexbar-signed-release-${{ steps.release.outputs.tag }}
+          path: release-final-output
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish verified assets to draft
+    needs: sign
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Checkout release scripts at the signed commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          ref: ${{ needs.sign.outputs.sha }}
+
+      - name: Verify publisher checkout matches signed SHA
+        shell: pwsh
+        env:
+          RELEASE_SHA: ${{ needs.sign.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = (& git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($head -ne $env:RELEASE_SHA.ToLowerInvariant()) {
+            throw "Publisher checkout '$head' does not equal signed SHA '$env:RELEASE_SHA'."
+          }
+          Write-Host "[ok] publisher scripts are checked out at $head"
+
+      - name: Download verified final bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: codexbar-signed-release-${{ needs.sign.outputs.tag }}
+          path: release-final-output
+
+      - name: Publish verified assets to a draft GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.sign.outputs.tag }}
+          RELEASE_SHA: ${{ needs.sign.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/publish-github-release.ps1 -AssetsDir release-final-output -Tag $env:RELEASE_TAG -Sha $env:RELEASE_SHA -Repository 'nesszer/Win-CodexBar'
+          if ($LASTEXITCODE -ne 0) { throw "draft release publication failed: $LASTEXITCODE" }

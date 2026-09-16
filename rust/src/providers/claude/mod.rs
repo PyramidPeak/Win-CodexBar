@@ -226,6 +226,8 @@ fn claude_probe_launch_args(session_id: &str) -> Vec<String> {
         "user".to_string(),
         "--allowed-tools".to_string(),
         String::new(),
+        "--settings".to_string(),
+        r#"{"remoteControlAtStartup":false}"#.to_string(),
         "--session-id".to_string(),
         session_id.to_string(),
     ]
@@ -1190,13 +1192,18 @@ mod tests {
         assert_eq!(first, second);
         assert!(uuid::Uuid::parse_str(&first).is_ok());
         let args = claude_probe_launch_args(&first);
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "--session-id" && w[1] == first)
-        );
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "--allowed-tools" && w[1].is_empty())
+        assert_eq!(
+            args,
+            vec![
+                "--setting-sources".to_string(),
+                "user".to_string(),
+                "--allowed-tools".to_string(),
+                String::new(),
+                "--settings".to_string(),
+                r#"{"remoteControlAtStartup":false}"#.to_string(),
+                "--session-id".to_string(),
+                first,
+            ]
         );
     }
 

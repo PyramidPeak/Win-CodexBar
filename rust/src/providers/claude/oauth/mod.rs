@@ -579,7 +579,7 @@ impl ClaudeOAuthFetcher {
                     .as_ref()
                     .and_then(|w| Self::to_rate_window(w, Some(300)))
             })
-            .unwrap_or_else(|| RateWindow::new(0.0));
+            .unwrap_or_else(RateWindow::no_active_session);
 
         let mut usage = UsageSnapshot::new(primary);
 

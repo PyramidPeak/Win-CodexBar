@@ -4,29 +4,74 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v0.53.1)'
+        description: 'Version tag whose version files must match (for example v0.60.3)'
         required: true
         type: string
+      source_ref:
+        description: 'Branch or commit containing this workflow and the matching version files'
+        required: true
+        default: main
+        type: string
+
+permissions:
+  actions: read
+  contents: read
 
 jobs:
   signpath-test:
-    name: Build, sign via SignPath, publish draft
+    name: Build, sign, and retain test bundle
     runs-on: windows-latest
-    permissions:
-      contents: write
-      actions: read
+    timeout-minutes: 240
 
     steps:
-      - name: Checkout code
+      - name: Checkout exact test tag
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.source_ref }}
 
-      - name: Resolve tag commit SHA
-        id: tag-sha
-        shell: bash
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Resolve immutable test identity
+        id: release
+        shell: pwsh
+        env:
+          TEST_TAG: ${{ inputs.tag }}
+          TEST_SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:TEST_TAG
+          if (-not ($tag -match '^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$')) {
+            throw "SignPath test accepts only canonical vX.Y.Z tags; received '$tag'."
+          }
+          $head = (& git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0) { throw "Could not resolve source ref '$($env:TEST_SOURCE_REF)'." }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha=$head" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "version=$($tag.Substring(1))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "[ok] test source identity: $($env:TEST_SOURCE_REF) -> $head for version $tag"
+
+      - name: Release preflight
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/release-preflight.ps1 -Tag $env:RELEASE_TAG -Sha $env:RELEASE_SHA -RepoRoot . -AllowTagSourceMismatch
+          if ($LASTEXITCODE -ne 0) { throw "release-preflight failed: $LASTEXITCODE" }
+
+      - name: Verify SignPath test configuration
+        shell: pwsh
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @('SIGNPATH_API_TOKEN')) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ([string]::IsNullOrWhiteSpace($value)) {
+              throw "$name is required; the test must fail rather than silently skip signing."
+            }
+          }
+          Write-Host '[ok] required SignPath test credentials are present'
 
       - name: Install release prerequisites
         shell: pwsh
@@ -35,109 +80,113 @@ jobs:
           & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/install-release-prerequisites.ps1 -RepoRoot .
           if ($LASTEXITCODE -ne 0) { throw "install-release-prerequisites failed: $LASTEXITCODE" }
 
-      - name: Release preflight
+      - name: Build unsigned test artifacts
         shell: pwsh
         env:
-          CIRCLE_TAG: ${{ inputs.tag }}
-          CIRCLE_SHA1: ${{ steps.tag-sha.outputs.sha }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
         run: |
           $ErrorActionPreference = 'Stop'
-          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/release-preflight.ps1 -Tag $env:CIRCLE_TAG -Sha $env:CIRCLE_SHA1 -RepoRoot .
-          if ($LASTEXITCODE -ne 0) { throw "release-preflight failed: $LASTEXITCODE" }
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/circleci-release-build.ps1 -Tag $env:RELEASE_TAG -Sha $env:RELEASE_SHA -RepoRoot . -OutputDir release-output
+          if ($LASTEXITCODE -ne 0) { throw "release build failed: $LASTEXITCODE" }
 
-      - name: Build release artifacts
+      - name: Prepare exact SignPath test input
         shell: pwsh
         env:
-          CIRCLE_TAG: ${{ inputs.tag }}
-          CIRCLE_SHA1: ${{ steps.tag-sha.outputs.sha }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
-          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/circleci-release-build.ps1 -Tag $env:CIRCLE_TAG -Sha $env:CIRCLE_SHA1 -RepoRoot .
-          if ($LASTEXITCODE -ne 0) { throw "circleci-release-build failed: $LASTEXITCODE" }
+          $inputDir = Join-Path (Get-Location) 'signing-test-input'
+          if (Test-Path -LiteralPath $inputDir) {
+            throw "Refusing to reuse signing test input directory: $inputDir"
+          }
+          New-Item -ItemType Directory -Force -Path $inputDir | Out-Null
+          $version = $env:RELEASE_VERSION
+          $names = @(
+            "CodexBar-$version-Setup.exe",
+            "CodexBar-$version-portable.exe",
+            "CodexBarCLI-v$version-windows-x64.zip"
+          )
+          foreach ($name in $names) {
+            $source = Join-Path (Get-Location) "release-output\$name"
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+              throw "Build output is missing the SignPath test asset: $source"
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $inputDir $name)
+          }
+          $files = @(Get-ChildItem -LiteralPath $inputDir -File | Select-Object -ExpandProperty Name | Sort-Object)
+          if (($files -join '|') -ne (($names | Sort-Object) -join '|')) {
+            throw "SignPath test input must contain exactly three top-level files; found $($files -join ', ')."
+          }
+          Write-Host "[ok] SignPath test input contains exactly: $($files -join ', ')"
 
-      - name: Prepare version (strip v prefix)
-        id: version
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.tag }}
-        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload unsigned artifacts for signing
+      - name: Upload unsigned test artifact
         id: upload-unsigned
         uses: actions/upload-artifact@v4
         with:
-          name: codexbar-unsigned-${{ inputs.tag }}
-          path: release-output/CodexBar-*.exe
+          name: codexbar-signing-test-input-${{ steps.release.outputs.tag }}
+          path: signing-test-input
           if-no-files-found: error
+          retention-days: 7
 
-      - name: Submit to SignPath for code signing
-        id: signpath
-        if: ${{ env.SIGNPATH_API_TOKEN != '' }}
+      - name: Verify GitHub access required by SignPath
+        shell: pwsh
         env:
-          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
-        uses: signpath/github-action-submit-signing-request@v2
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.upload-unsigned.outputs.artifact-id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $jobsEndpoint = "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID/jobs"
+          gh api $jobsEndpoint --silent
+          if ($LASTEXITCODE -ne 0) { throw "GITHUB_TOKEN cannot read workflow jobs." }
+
+          $artifactEndpoint = "repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:ARTIFACT_ID"
+          gh api $artifactEndpoint --silent
+          if ($LASTEXITCODE -ne 0) { throw "GITHUB_TOKEN cannot read artifact metadata." }
+
+          $headers = Join-Path $env:RUNNER_TEMP 'signpath-artifact-download-headers.txt'
+          curl.exe -sS --max-redirs 0 -D $headers -o NUL `
+            -H "Authorization: Bearer $env:GH_TOKEN" `
+            -H 'Accept: application/vnd.github+json' `
+            "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:ARTIFACT_ID/zip"
+          if ($LASTEXITCODE -ne 0) { throw "GITHUB_TOKEN artifact download probe failed." }
+
+          $status = Get-Content -LiteralPath $headers -First 1
+          if ($status -notmatch '\s302\s') {
+            throw "GITHUB_TOKEN cannot obtain artifact download redirect: $status"
+          }
+          Write-Host '[ok] GITHUB_TOKEN can read workflow jobs, artifact metadata, and artifact download'
+
+      - name: Submit test signing request
+        uses: signpath/github-action-submit-signing-request@v3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
-          project-slug: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
-          signing-policy-slug: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+          organization-id: 9f67194d-974c-4e9c-bac7-20248e8b6c39
+          project-slug: Win-CodexBar
+          signing-policy-slug: test-signing
           artifact-configuration-slug: codexbar-installer
           github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
           wait-for-completion: true
-          output-artifact-directory: release-signed
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: release-test-signed
           parameters: |
-            version: "${{ steps.version.outputs.version }}"
+            version: "${{ steps.release.outputs.version }}"
 
-      - name: Replace unsigned artifacts and recompute manifest
-        shell: pwsh
-        if: ${{ steps.signpath.conclusion == 'success' }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $version = '${{ steps.version.outputs.version }}'
-          $outputDir = 'release-output'
-          $signedDir = 'release-signed'
-          foreach ($name in @("CodexBar-$version-Setup.exe", "CodexBar-$version-portable.exe")) {
-            $signedPath = Join-Path $signedDir $name
-            $outputPath = Join-Path $outputDir $name
-            if (Test-Path $signedPath) {
-              Copy-Item $signedPath $outputPath -Force
-              $hash = (Get-FileHash -Algorithm SHA256 $outputPath).Hash.ToLower()
-              "$hash  $name" | Set-Content -Encoding ascii "$outputPath.sha256"
-              Write-Host "[ok] Signed: $name ($hash)"
-            } else {
-              Write-Host "[warn] Signed version not found, keeping unsigned: $name"
-            }
-          }
-          # Recompute release-manifest.json with signed hashes
-          $manifestPath = Join-Path $outputDir 'release-manifest.json'
-          if (Test-Path $manifestPath) {
-            $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
-            foreach ($asset in $manifest.assets) {
-              $assetPath = Join-Path $outputDir $asset.name
-              if (Test-Path $assetPath) {
-                $asset.sha256 = (Get-FileHash -Algorithm SHA256 $assetPath).Hash.ToLower()
-                $asset.bytes = (Get-Item -LiteralPath $assetPath).Length
-                Write-Host "[ok] Updated manifest hash for $($asset.name)"
-              }
-            }
-            $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
-            Write-Host "[ok] release-manifest.json recomputed with signed hashes"
-          }
-
-      - name: Publish draft GitHub release
+      - name: Verify signed test output and create final test bundle
         shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CIRCLE_TAG: ${{ inputs.tag }}
-          CIRCLE_SHA1: ${{ steps.tag-sha.outputs.sha }}
-          RELEASE_SHA: ${{ steps.tag-sha.outputs.sha }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          SIGNPATH_TEST_CERT_THUMBPRINT: ${{ vars.SIGNPATH_TEST_CERT_THUMBPRINT }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $version = '${{ steps.version.outputs.version }}'
-          $outputDir = 'release-output'
-          $tag = '${{ inputs.tag }}'
-          $assets = Get-ChildItem "$outputDir\CodexBar-$version-*", "$outputDir\CodexBarCLI-v$version-*" |
-            Where-Object { $_.Name -notmatch '\.log$' } |
-            Select-Object -ExpandProperty FullName
-          gh release create $tag --repo nesszer/Win-CodexBar --draft --title "Win-CodexBar $version" --notes "Release $version" @assets
-          if ($LASTEXITCODE -ne 0) { throw "gh release create failed: $LASTEXITCODE" }
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/finalize-signed-release.ps1 -SignedOutputDir release-test-signed -FinalOutputDir release-test-final-output -Tag $env:RELEASE_TAG -Sha $env:RELEASE_SHA -ExpectedSignerThumbprint $env:SIGNPATH_TEST_CERT_THUMBPRINT -Repository 'nesszer/Win-CodexBar'
+          if ($LASTEXITCODE -ne 0) { throw "signed test finalization failed: $LASTEXITCODE" }
+
+      - name: Retain verified test bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: codexbar-signed-test-${{ steps.release.outputs.tag }}
+          path: release-test-final-output
+          if-no-files-found: error
+          retention-days: 30

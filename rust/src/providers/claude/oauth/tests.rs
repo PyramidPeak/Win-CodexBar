@@ -80,6 +80,27 @@ fn preserves_existing_percentage_utilization() {
 }
 
 #[test]
+fn missing_oauth_session_is_informational_and_keeps_weekly_lane() {
+    let response: OAuthUsageResponse = serde_json::from_str(
+        r#"{
+            "seven_day": {"utilization": 51.0, "resets_at": "2026-08-20T12:00:00Z"}
+        }"#,
+    )
+    .expect("OAuth response without a session lane should parse");
+
+    let usage =
+        ClaudeOAuthFetcher::new().build_usage_snapshot(&response, &test_credentials("token"));
+
+    assert!(usage.primary.is_informational);
+    assert_eq!(usage.primary.window_minutes, Some(300));
+    assert_eq!(
+        usage.primary.reset_description.as_deref(),
+        Some("No active 5h session")
+    );
+    assert_eq!(usage.secondary.expect("weekly lane").used_percent, 51.0);
+}
+
+#[test]
 fn parses_current_snake_case_oauth_usage_response() {
     let response: OAuthUsageResponse = serde_json::from_str(
         r#"{

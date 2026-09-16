@@ -862,22 +862,15 @@ fn notify_usage_thresholds(
                     .and_then(ProviderAccountData::active_account)
                     .map(|account| account.id);
                 let account = quota_notification_account_identity(snapshot, token_account_id);
-                // Skip session notifications for synthetic/no-session placeholders
-                // (e.g. Claude web five_hour: null → informational 5h 0%).
-                if !snapshot.primary.is_informational {
-                    guard.notification_manager.check_and_notify(
-                        provider,
-                        &account,
-                        "session",
-                        snapshot.primary.used_percent,
-                        settings,
-                    );
-                    guard.notification_manager.check_session_transition(
-                        provider,
-                        &account,
-                        snapshot.primary.used_percent,
-                        settings,
-                    );
+                // Skip all session consumers for synthetic/no-session
+                // placeholders (e.g. Claude OAuth five_hour: null).
+                if guard.notification_manager.check_session_lane(
+                    provider,
+                    &account,
+                    snapshot.primary.used_percent,
+                    snapshot.primary.is_informational,
+                    settings,
+                ) {
                     dispatch_quota_hooks(
                         settings,
                         provider,
