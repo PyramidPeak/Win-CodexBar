@@ -642,7 +642,10 @@ pub(super) fn preserve_weekly(state: &AccountState, mut current: UsageSnapshot) 
 }
 
 fn weekly(snapshot: &UsageSnapshot) -> Option<&RateWindow> {
-    snapshot.secondary.as_ref()
+    snapshot
+        .secondary
+        .as_ref()
+        .filter(|window| window.usage_known())
 }
 
 fn is_valid_boundary(window: &RateWindow, captured_at: DateTime<Utc>) -> bool {

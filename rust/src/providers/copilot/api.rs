@@ -471,6 +471,7 @@ impl UsableQuota {
             resets_at: reset,
             reset_description,
             is_informational: false,
+            usage_known: true,
         }
     }
 }

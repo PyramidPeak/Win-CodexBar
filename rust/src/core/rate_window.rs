@@ -91,6 +91,16 @@ pub struct RateWindow {
     /// Whether this row is an informational value rather than a quota.
     #[serde(default)]
     pub is_informational: bool,
+
+    /// Whether the provider explicitly supplied the usage percentage.
+    /// Internal-only metadata prevents a missing value normalized to zero from
+    /// becoming an exported quota measurement.
+    #[serde(default = "rate_window_usage_known_default", skip_serializing)]
+    pub(crate) usage_known: bool,
+}
+
+fn rate_window_usage_known_default() -> bool {
+    true
 }
 
 impl RateWindow {
@@ -102,6 +112,7 @@ impl RateWindow {
             resets_at: None,
             reset_description: None,
             is_informational: false,
+            usage_known: true,
         }
     }
 
@@ -110,6 +121,7 @@ impl RateWindow {
         Self {
             reset_description: Some(description.into()),
             is_informational: true,
+            usage_known: false,
             ..Self::new(0.0)
         }
     }
@@ -140,7 +152,17 @@ impl RateWindow {
             resets_at,
             reset_description,
             is_informational: false,
+            usage_known: true,
         }
+    }
+
+    pub(crate) fn with_usage_known(mut self, usage_known: bool) -> Self {
+        self.usage_known = usage_known;
+        self
+    }
+
+    pub(crate) fn usage_known(&self) -> bool {
+        self.usage_known
     }
 
     /// Real UTC Gregorian month length ending at `resets_at`, in minutes.
@@ -270,6 +292,16 @@ mod tests {
         );
         assert_eq!(window.used_percent, 0.0);
         assert_eq!(window.resets_at, None);
+        assert!(!window.usage_known());
+    }
+
+    #[test]
+    fn internal_usage_known_metadata_is_not_serialized() {
+        let window = RateWindow::with_details(0.0, Some(300), None, None).with_usage_known(false);
+        let json = serde_json::to_value(window).expect("rate window JSON");
+
+        assert!(json.get("usage_known").is_none());
+        assert!(json.get("usageKnown").is_none());
     }
 
     #[test]

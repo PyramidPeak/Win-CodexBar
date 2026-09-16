@@ -129,6 +129,11 @@ pub struct UsageSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_specific: Option<RateWindow>,
 
+    /// Whether `model_specific` came from Codex's explicit code-review lane.
+    /// Internal-only metadata keeps generic positional fallbacks out of metrics.
+    #[serde(skip)]
+    pub(crate) model_specific_is_code_review: bool,
+
     /// Tertiary rate window (e.g., 30-day quota for Infini)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tertiary: Option<RateWindow>,
@@ -167,6 +172,7 @@ impl UsageSnapshot {
             secondary: None,
             secondary_label: None,
             model_specific: None,
+            model_specific_is_code_review: false,
             tertiary: None,
             extra_rate_windows: Vec::new(),
             updated_at: Utc::now(),
@@ -198,7 +204,21 @@ impl UsageSnapshot {
     /// Builder pattern: set model-specific window
     pub fn with_model_specific(mut self, model_specific: RateWindow) -> Self {
         self.model_specific = Some(model_specific);
+        self.model_specific_is_code_review = false;
         self
+    }
+
+    /// Mark a Codex window that came from the explicit `code_review_window` field.
+    pub(crate) fn with_code_review(mut self, code_review: RateWindow) -> Self {
+        self.model_specific = Some(code_review);
+        self.model_specific_is_code_review = true;
+        self
+    }
+
+    pub(crate) fn code_review_window(&self) -> Option<&RateWindow> {
+        self.model_specific_is_code_review
+            .then_some(self.model_specific.as_ref())
+            .flatten()
     }
 
     /// Builder pattern: set tertiary window
@@ -289,6 +309,21 @@ impl UsageSnapshot {
                 .extra_rate_windows
                 .iter()
                 .any(|extra| extra.window.is_exhausted())
+    }
+}
+
+#[cfg(test)]
+mod internal_projection_tests {
+    use super::*;
+
+    #[test]
+    fn code_review_source_marker_is_not_serialized() {
+        let snapshot =
+            UsageSnapshot::new(RateWindow::new(10.0)).with_code_review(RateWindow::new(20.0));
+        let json = serde_json::to_value(snapshot).expect("usage snapshot JSON");
+
+        assert!(json.get("model_specific_is_code_review").is_none());
+        assert!(json.get("modelSpecificIsCodeReview").is_none());
     }
 }
 

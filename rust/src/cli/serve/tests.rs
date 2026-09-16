@@ -633,33 +633,36 @@ fn stub_build(identity: DashboardIdMode, with_accounts: bool, delay: Duration) -
 }
 
 fn stub_state_ok() -> dashboard::DashboardState {
-    let build: SnapshotArtifactsBuildFn = std::sync::Arc::new(|| {
-        Box::pin(async move {
-            let mut usage = crate::core::UsageSnapshot::new(crate::core::RateWindow::new(11.0));
-            usage.updated_at = chrono::Utc::now();
-            let input = SnapshotInput {
-                providers: vec![ProviderFetchEnvelope {
-                    id: "codex".to_string(),
-                    display_name: "Codex".to_string(),
-                    session_label: "Session".to_string(),
-                    weekly_label: "Weekly".to_string(),
-                    fetch: Ok(crate::core::ProviderFetchResult::new(usage, "test")),
-                }],
-                costs: std::collections::HashMap::new(),
-                claude_accounts: None,
-                identity: DashboardIdMode::Redacted,
-                generated_at: chrono::Utc::now(),
-                refresh_seconds: 60,
-                version: Some("test".to_string()),
-                order: vec!["codex".to_string()],
-                enabled: ["codex".to_string()].into_iter().collect(),
-            };
-            Ok(SnapshotArtifacts {
-                metrics: Some(metrics::MetricsSnapshot::from_input(&input)),
-                dashboard: build_snapshot(&input),
+    let build: SnapshotArtifactsBuildFn =
+        std::sync::Arc::new(|| {
+            Box::pin(async move {
+                let mut usage = crate::core::UsageSnapshot::new(
+                    crate::core::RateWindow::with_details(11.0, Some(300), None, None),
+                );
+                usage.updated_at = chrono::Utc::now();
+                let input = SnapshotInput {
+                    providers: vec![ProviderFetchEnvelope {
+                        id: "codex".to_string(),
+                        display_name: "Codex".to_string(),
+                        session_label: "Session".to_string(),
+                        weekly_label: "Weekly".to_string(),
+                        fetch: Ok(crate::core::ProviderFetchResult::new(usage, "test")),
+                    }],
+                    costs: std::collections::HashMap::new(),
+                    claude_accounts: None,
+                    identity: DashboardIdMode::Redacted,
+                    generated_at: chrono::Utc::now(),
+                    refresh_seconds: 60,
+                    version: Some("test".to_string()),
+                    order: vec!["codex".to_string()],
+                    enabled: ["codex".to_string()].into_iter().collect(),
+                };
+                Ok(SnapshotArtifacts {
+                    metrics: Some(metrics::MetricsSnapshot::from_input(&input)),
+                    dashboard: build_snapshot(&input),
+                })
             })
-        })
-    });
+        });
     dashboard::DashboardState::stub_with_artifacts(build, 3600, Some(DashboardIdMode::Redacted))
 }
 
@@ -761,8 +764,28 @@ async fn metrics_route_uses_bearer_gate_and_prometheus_content_type() {
     assert!(ok.starts_with("HTTP/1.1 200"), "got: {ok}");
     assert!(ok.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"));
     assert!(ok.contains("Cache-Control: no-store\r\n"));
-    assert!(ok.contains("codexbar_build_info{"), "got: {ok}");
-    assert!(ok.contains("codexbar_quota_used_percent{"), "got: {ok}");
+    assert!(
+        ok.contains("codexbar_snapshot_schema_version 1\n"),
+        "got: {ok}"
+    );
+    assert!(
+        ok.contains("codexbar_quota_session_used_ratio{provider=\"codex\"}"),
+        "got: {ok}"
+    );
+}
+
+#[tokio::test]
+async fn metrics_route_returns_500_when_exporter_state_is_missing() {
+    let mut config = dashboard_test_config(Some("s3cret"), None);
+    config.metrics_enabled = true;
+    let response = request_roundtrip_dashboard(
+        b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer s3cret\r\n\r\n",
+        config,
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 500"), "got: {response}");
+    assert!(response.contains(r#""error":"dashboard not configured""#));
 }
 
 #[tokio::test]

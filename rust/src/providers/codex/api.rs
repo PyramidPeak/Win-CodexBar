@@ -528,7 +528,8 @@ impl CodexApi {
             .map(|s| s.to_string());
 
         // Extract rate limit info - handle multiple possible structures
-        let (primary, secondary, monthly, code_review) = self.extract_rate_limits(json);
+        let (primary, secondary, monthly, code_review, code_review_verified) =
+            self.extract_rate_limits(json);
 
         // Build login method string
         let login_method = plan_type.as_deref().map(format_plan_type);
@@ -543,7 +544,11 @@ impl CodexApi {
             usage = usage.with_tertiary(mo);
         }
         if let Some(cr) = code_review {
-            usage = usage.with_model_specific(cr);
+            usage = if code_review_verified {
+                usage.with_code_review(cr)
+            } else {
+                usage.with_model_specific(cr)
+            };
         }
         for extra in self.extract_additional_rate_limits(json) {
             usage.extra_rate_windows.push(extra);
@@ -558,6 +563,14 @@ impl CodexApi {
         Ok((usage, cost))
     }
 
+    #[cfg(test)]
+    pub(crate) fn build_result_from_json_for_test(
+        &self,
+        json: &serde_json::Value,
+    ) -> Result<(UsageSnapshot, Option<CostSnapshot>), ProviderError> {
+        self.build_result_from_json(json)
+    }
+
     fn extract_rate_limits(
         &self,
         json: &serde_json::Value,
@@ -566,6 +579,7 @@ impl CodexApi {
         Option<RateWindow>,
         Option<RateWindow>,
         Option<RateWindow>,
+        bool,
     ) {
         // Try rate_limit object
         if let Some(rate_limit) = json.get("rate_limit") {
@@ -585,7 +599,8 @@ impl CodexApi {
 
             // F5 (upstream 0.48.0): named windows carry only session/weekly/code_review.
             // Monthly is extracted separately (from array windows) — return None here.
-            return (primary, secondary, None, code_review);
+            let code_review_verified = code_review.is_some();
+            return (primary, secondary, None, code_review, code_review_verified);
         }
 
         // Try rate_limits array
@@ -611,6 +626,7 @@ impl CodexApi {
                 usage.secondary,
                 usage.tertiary,
                 usage.model_specific,
+                false,
             );
         }
 
@@ -618,18 +634,18 @@ impl CodexApi {
         let used_percent = json
             .get("used_percent")
             .or_else(|| json.get("usage_percent"))
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+            .and_then(json_f64);
+        let primary = RateWindow::new(used_percent.unwrap_or(0.0))
+            .with_usage_known(valid_used_percent(used_percent));
 
-        (RateWindow::new(used_percent), None, None, None)
+        (primary, None, None, None, false)
     }
 
     fn parse_window(&self, window: &serde_json::Value) -> RateWindow {
         let used_percent = window
             .get("used_percent")
             .or_else(|| window.get("usage_percent"))
-            .and_then(json_f64)
-            .unwrap_or(0.0);
+            .and_then(json_f64);
 
         let window_minutes = window
             .get("limit_window_seconds")
@@ -642,11 +658,12 @@ impl CodexApi {
             .and_then(|ts| Utc.timestamp_opt(ts, 0).single());
 
         RateWindow::with_details(
-            used_percent,
+            used_percent.unwrap_or(0.0),
             window_minutes,
             reset_at,
             format_reset_countdown(reset_at),
         )
+        .with_usage_known(valid_used_percent(used_percent))
     }
 
     fn parse_window_if_present(&self, window: &serde_json::Value) -> Option<RateWindow> {
@@ -787,7 +804,7 @@ impl CodexApi {
             usage = usage.with_secondary(sec);
         }
         if let Some(cr) = code_review {
-            usage = usage.with_model_specific(cr);
+            usage = usage.with_code_review(cr);
         }
         if let Some(method) = login_method {
             usage = usage.with_login_method(method);
@@ -935,14 +952,16 @@ fn normalize_array_windows(
 
 fn rate_window_from_snapshot(window: &WindowSnapshot) -> RateWindow {
     let reset_at = timestamp_to_datetime(window.reset_at);
+    let used_percent = f64::from(window.used_percent);
     RateWindow::with_details(
-        window.used_percent as f64,
+        used_percent,
         window
             .limit_window_seconds
             .and_then(|seconds| u32::try_from(seconds / 60).ok()),
         reset_at,
         format_reset_countdown(reset_at),
     )
+    .with_usage_known(valid_used_percent(Some(used_percent)))
 }
 
 fn format_plan_type(plan_type: &str) -> String {
@@ -1177,6 +1196,10 @@ fn json_i64(value: &serde_json::Value) -> Option<i64> {
     value
         .as_i64()
         .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
+}
+
+fn valid_used_percent(value: Option<f64>) -> bool {
+    value.is_some_and(|value| value.is_finite() && (0.0..=100.0).contains(&value))
 }
 
 fn is_placeholder_window(window: &serde_json::Value) -> bool {
