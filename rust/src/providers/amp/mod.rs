@@ -268,9 +268,14 @@ const AMP_MONTHLY_WINDOW_MINUTES: u32 = 30 * 24 * 60;
 pub struct AmpSubscriptionUsage {
     pub plan: String,
     pub other_used_percent: f64,
-    pub orb_used_percent: f64,
-    pub resets_at: chrono::DateTime<chrono::Utc>,
+    pub orb_used_percent: Option<f64>,
+    pub resets_at: Option<chrono::DateTime<chrono::Utc>>,
     pub reset_description: String,
+    pub agent_remaining: Option<f64>,
+    pub agent_limit: Option<f64>,
+    pub period_start: Option<chrono::DateTime<chrono::Utc>>,
+    pub orb_hours_remaining: Option<f64>,
+    pub orb_hours_limit: Option<f64>,
 }
 
 /// Parse Amp Free percentage lines from CLI/display text (upstream 0.42.1+ shape).
@@ -342,6 +347,75 @@ pub fn parse_amp_subscription_usage(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<AmpSubscriptionUsage> {
     let text = text.replace("**", "");
+
+    // Current Amp output reports the agent allowance in dollars and the Orb
+    // allowance in hours. The displayed percentages are rounded, so derive
+    // both usage lanes from their exact remaining/limit values instead.
+    let tier_re = regex_lite::Regex::new(
+        r"(?im)^\s*Amp\s+(.+?)\s+Tier:\s*agent\s+usage\s+\$([0-9][0-9,]*(?:\.[0-9]+)?)\s+of\s+\$([0-9][0-9,]*(?:\.[0-9]+)?)\s+remaining\b(.*?)resets\s+upon\s+renewal\s+in\s+([0-9][0-9,]*)\s+(days?|months?)\b",
+    )
+    .ok()?;
+    let orb_re = regex_lite::Regex::new(
+        r"(?i)\borb\s+usage\s+([0-9][0-9,]*(?:\.[0-9]+)?)h\s+of\s+([0-9][0-9,]*(?:\.[0-9]+)?)h\s+a1\.small\s+orb\s+hours\s+remaining\b",
+    )
+    .ok()?;
+
+    for line in text.lines() {
+        let Some(caps) = tier_re.captures(line) else {
+            continue;
+        };
+        let plan = caps.get(1)?.as_str().trim();
+        let agent_remaining = parse_amp_number(caps.get(2)?.as_str())?;
+        let agent_limit = parse_amp_number(caps.get(3)?.as_str())?;
+        let details = caps.get(4)?.as_str();
+        let renewal_value: i64 = caps.get(5)?.as_str().replace(',', "").parse().ok()?;
+        let renewal_unit = caps.get(6)?.as_str().to_ascii_lowercase();
+        let reset_description = if renewal_value == 1 {
+            format!(
+                "renews in 1 {}",
+                if renewal_unit.starts_with("month") {
+                    "month"
+                } else {
+                    "day"
+                }
+            )
+        } else {
+            format!(
+                "renews in {renewal_value} {}",
+                if renewal_unit.starts_with("month") {
+                    "months"
+                } else {
+                    "days"
+                }
+            )
+        };
+        let (period_start, resets_at) = parse_amp_tier_period(details).unzip();
+        let orb = orb_re.captures(details).and_then(|orb_caps| {
+            let remaining = parse_amp_number(orb_caps.get(1)?.as_str())?;
+            let limit = parse_amp_number(orb_caps.get(2)?.as_str())?;
+            (limit > 0.0).then_some((remaining, limit))
+        });
+        let other_used_percent = if agent_limit > 0.0 {
+            ((agent_limit - agent_remaining) / agent_limit * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        let orb_used_percent =
+            orb.map(|(remaining, limit)| ((limit - remaining) / limit * 100.0).clamp(0.0, 100.0));
+        return Some(AmpSubscriptionUsage {
+            plan: plan.to_string(),
+            other_used_percent,
+            orb_used_percent,
+            resets_at,
+            reset_description,
+            agent_remaining: Some(agent_remaining),
+            agent_limit: Some(agent_limit),
+            period_start,
+            orb_hours_remaining: orb.map(|(remaining, _)| remaining),
+            orb_hours_limit: orb.map(|(_, limit)| limit),
+        });
+    }
+
     let re = regex_lite::Regex::new(
         r"(?im)^\s*Subscription\s+(.+?):\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*%\s+other\s+usage\s+and\s+([0-9][0-9,]*(?:\.[0-9]+)?)\s*%\s+orb\s+usage\s+remaining\s*-\s*resets\s+upon\s+renewal\s+in\s+([0-9][0-9,]*)\s+(days?|months?)(?:\s+-\s+https?://\S+)?\s*$",
     )
@@ -381,12 +455,37 @@ pub fn parse_amp_subscription_usage(
         return Some(AmpSubscriptionUsage {
             plan: plan.to_string(),
             other_used_percent: 100.0 - other_remaining.clamp(0.0, 100.0),
-            orb_used_percent: 100.0 - orb_remaining.clamp(0.0, 100.0),
-            resets_at,
+            orb_used_percent: Some(100.0 - orb_remaining.clamp(0.0, 100.0)),
+            resets_at: Some(resets_at),
             reset_description,
+            agent_remaining: None,
+            agent_limit: None,
+            period_start: None,
+            orb_hours_remaining: None,
+            orb_hours_limit: None,
         });
     }
     None
+}
+
+fn parse_amp_tier_period(
+    text: &str,
+) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    use chrono::NaiveDate;
+
+    let re =
+        regex_lite::Regex::new(r"(?i)\bperiod\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})\b")
+            .ok()?;
+    let caps = re.captures(text)?;
+    let start = NaiveDate::parse_from_str(caps.get(1)?.as_str(), "%Y-%m-%d")
+        .ok()?
+        .and_hms_opt(0, 0, 0)?
+        .and_utc();
+    let end = NaiveDate::parse_from_str(caps.get(2)?.as_str(), "%Y-%m-%d")
+        .ok()?
+        .and_hms_opt(0, 0, 0)?
+        .and_utc();
+    (end > start).then_some((start, end))
 }
 
 /// Add whole calendar months via chrono's calendar arithmetic, mirroring
@@ -410,27 +509,43 @@ pub fn usage_snapshot_from_amp_display_text(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<UsageSnapshot> {
     if let Some(sub) = parse_amp_subscription_usage(text, now) {
-        // Labels: primary = "Other usage", secondary = "Orb usage"
-        // (surfaced via provider session/weekly labels + plan login_method).
-        let monthly_minutes = RateWindow::monthly_window_minutes(Some(sub.resets_at))
-            .unwrap_or(AMP_MONTHLY_WINDOW_MINUTES);
-        let other = RateWindow::with_details(
-            sub.other_used_percent,
-            Some(monthly_minutes),
-            Some(sub.resets_at),
-            Some(sub.reset_description.clone()),
-        );
-        let orb = RateWindow::with_details(
-            sub.orb_used_percent,
-            Some(monthly_minutes),
-            Some(sub.resets_at),
-            Some(sub.reset_description),
-        );
-        return Some(
-            UsageSnapshot::new(other)
-                .with_secondary(orb)
-                .with_login_method(sub.plan),
-        );
+        let measured_window_minutes = match (sub.period_start, sub.resets_at) {
+            (Some(start), Some(end)) => u32::try_from((end - start).num_minutes())
+                .ok()
+                .filter(|minutes| *minutes > 0),
+            _ => None,
+        };
+        let legacy_window_minutes =
+            RateWindow::monthly_window_minutes(sub.resets_at).or(Some(AMP_MONTHLY_WINDOW_MINUTES));
+        let window_minutes = if sub.agent_limit.is_some() {
+            measured_window_minutes
+        } else {
+            legacy_window_minutes
+        };
+        let primary = if sub.agent_limit.is_some() && sub.agent_limit <= Some(0.0) {
+            RateWindow::informational("No active Amp tier allowance")
+        } else {
+            RateWindow::with_details(
+                sub.other_used_percent,
+                window_minutes,
+                sub.resets_at,
+                Some(sub.reset_description.clone()),
+            )
+        };
+        let mut usage = UsageSnapshot::new(primary).with_login_method(sub.plan);
+        if sub.agent_limit.is_some() {
+            usage.primary_label = Some("Agent usage".to_string());
+        }
+        if let Some(orb_used_percent) = sub.orb_used_percent {
+            let orb = RateWindow::with_details(
+                orb_used_percent,
+                window_minutes,
+                sub.resets_at,
+                Some(sub.reset_description),
+            );
+            usage = usage.with_secondary(orb).with_secondary_label("Orb usage");
+        }
+        return Some(usage);
     }
 
     let free_used = parse_amp_free_percent_remaining(text)?;
@@ -511,8 +626,8 @@ mod tests {
         .expect("bold subscription");
         assert_eq!(sub.plan, "Megawatt");
         assert!((sub.other_used_percent - 32.0).abs() < f64::EPSILON);
-        assert!((sub.orb_used_percent - 3.0).abs() < f64::EPSILON);
-        assert_eq!(sub.resets_at, now + chrono::Duration::days(5));
+        assert!((sub.orb_used_percent.unwrap() - 3.0).abs() < f64::EPSILON);
+        assert_eq!(sub.resets_at, Some(now + chrono::Duration::days(5)));
     }
 
     #[test]
@@ -537,9 +652,9 @@ Subscription Megawatt: 42% other usage and 88% orb usage remaining - resets upon
         let sub = parse_amp_subscription_usage(text, now).expect("subscription");
         assert_eq!(sub.plan, "Megawatt");
         assert!((sub.other_used_percent - 58.0).abs() < f64::EPSILON);
-        assert!((sub.orb_used_percent - 12.0).abs() < f64::EPSILON);
+        assert!((sub.orb_used_percent.unwrap() - 12.0).abs() < f64::EPSILON);
         assert_eq!(sub.reset_description, "renews in 12 days");
-        assert_eq!(sub.resets_at, now + chrono::Duration::days(12));
+        assert_eq!(sub.resets_at, Some(now + chrono::Duration::days(12)));
 
         let snapshot = usage_snapshot_from_amp_display_text(text, now).expect("snapshot");
         assert!((snapshot.primary.used_percent - 58.0).abs() < f64::EPSILON);
@@ -569,7 +684,7 @@ Subscription Megawatt: 42% other usage and 88% orb usage remaining - resets upon
         let sub = parse_amp_subscription_usage(text, now).unwrap();
         assert_eq!(sub.reset_description, "renews in 1 day");
         assert!((sub.other_used_percent - 100.0).abs() < f64::EPSILON);
-        assert!((sub.orb_used_percent - 0.0).abs() < f64::EPSILON);
+        assert!((sub.orb_used_percent.unwrap() - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -583,7 +698,7 @@ Subscription Megawatt: 42% other usage and 88% orb usage remaining - resets upon
         assert_eq!(sub.reset_description, "renews in 2 months");
         assert_eq!(
             sub.resets_at,
-            Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap()
+            Some(Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap())
         );
     }
 
@@ -635,11 +750,69 @@ mod current_subscription_tests {
 
         assert_eq!(sub.plan, "Megawatt");
         assert!((sub.other_used_percent - 0.0).abs() < f64::EPSILON);
-        assert!((sub.orb_used_percent - 0.0).abs() < f64::EPSILON);
+        assert!((sub.orb_used_percent.unwrap() - 0.0).abs() < f64::EPSILON);
         assert_eq!(
             sub.resets_at,
-            Utc.with_ymd_and_hms(2026, 9, 18, 12, 0, 0).unwrap()
+            Some(Utc.with_ymd_and_hms(2026, 9, 18, 12, 0, 0).unwrap())
         );
         assert_eq!(sub.reset_description, "renews in 1 month");
+    }
+
+    #[test]
+    fn parses_tier_allowances_from_exact_balances_and_period() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 16, 12, 0, 0).unwrap();
+        let text = "Amp Megawatt Tier: agent usage $18.57 of $20 remaining (93%), \
+orb usage 732.8h of 750h a1.small orb hours remaining (98%) - \
+period 2026-09-13 to 2026-10-13, resets upon renewal in 27 days";
+
+        let sub = parse_amp_subscription_usage(text, now).expect("tier");
+        assert_eq!(sub.plan, "Megawatt");
+        assert!((sub.other_used_percent - 7.15).abs() < 0.0001);
+        assert!((sub.orb_used_percent.unwrap() - 2.2933333333).abs() < 0.0001);
+        assert_eq!(sub.agent_remaining, Some(18.57));
+        assert_eq!(sub.agent_limit, Some(20.0));
+        assert_eq!(sub.orb_hours_remaining, Some(732.8));
+        assert_eq!(sub.orb_hours_limit, Some(750.0));
+        assert_eq!(
+            sub.resets_at,
+            Some(Utc.with_ymd_and_hms(2026, 10, 13, 0, 0, 0).unwrap())
+        );
+
+        let snapshot = usage_snapshot_from_amp_display_text(text, now).expect("snapshot");
+        assert!((snapshot.primary.used_percent - 7.15).abs() < 0.0001);
+        assert_eq!(snapshot.primary.window_minutes, Some(30 * 24 * 60));
+        assert_eq!(snapshot.primary_label.as_deref(), Some("Agent usage"));
+        let secondary = snapshot.secondary.expect("orb");
+        assert!((secondary.used_percent - 2.2933333333).abs() < 0.0001);
+        assert_eq!(snapshot.secondary_label.as_deref(), Some("Orb usage"));
+    }
+
+    #[test]
+    fn invalid_tier_period_does_not_invent_reset_window() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 16, 12, 0, 0).unwrap();
+        let text = "Amp Example Tier: agent usage $18 of $20 remaining - \
+period 2026-02-30 to 2026-03-30, resets upon renewal in 27 days";
+        let sub = parse_amp_subscription_usage(text, now).expect("tier");
+        assert!(sub.period_start.is_none());
+        assert!(sub.resets_at.is_none());
+
+        let snapshot = usage_snapshot_from_amp_display_text(text, now).expect("snapshot");
+        assert_eq!(snapshot.primary.used_percent, 10.0);
+        assert!(snapshot.primary.window_minutes.is_none());
+        assert!(snapshot.primary.resets_at.is_none());
+        assert_eq!(
+            snapshot.primary.reset_description.as_deref(),
+            Some("renews in 27 days")
+        );
+    }
+
+    #[test]
+    fn tier_without_orb_keeps_agent_lane() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 16, 12, 0, 0).unwrap();
+        let text = "Amp Example Tier: agent usage $3 of $20 remaining - \
+period 2026-09-13 to 2026-10-13, resets upon renewal in 27 days";
+        let snapshot = usage_snapshot_from_amp_display_text(text, now).expect("snapshot");
+        assert!(snapshot.secondary.is_none());
+        assert_eq!(snapshot.primary.used_percent, 85.0);
     }
 }
