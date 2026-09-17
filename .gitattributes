@@ -7,3 +7,6 @@ Package.swift linguist-vendored
 # Pi-family session fixtures are byte-exact copies of upstream wire shapes;
 # never EOL-convert them (parsers split on LF).
 rust/src/agent_sessions/fixtures/** -text
+
+# Bash scripts must remain LF for Linux and WSL execution.
+*.sh text eol=lf

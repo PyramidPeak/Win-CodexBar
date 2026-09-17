@@ -32,6 +32,16 @@ function Invoke-Step {
     }
 }
 
+function Invoke-WorktreeStorageAudit {
+    $auditScript = Join-Path $PSScriptRoot "worktree-storage.ps1"
+    Write-Host ""
+    Write-Host "==> Worktree storage audit (read-only)" -ForegroundColor Cyan
+    & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $auditScript -RepoRoot $RepoRoot
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Worktree storage audit could not complete; continuing with the requested local checks."
+    }
+}
+
 # Hosted pr-check slice (-Slice ci): mirrors .github/workflows/pr-check.yml
 # step for step (workspace-wide fmt/clippy/test, frozen frontend install,
 # frontend lint/rule tests/build, interaction-guard script tests). The guard's
@@ -66,6 +76,8 @@ if (-not ($Rust -or $Tauri -or $Frontend -or $Format -or $Clippy -or $ReleaseDoc
 
 Push-Location $RepoRoot
 try {
+    . (Join-Path $PSScriptRoot "worktree-env.ps1") -RepoRoot $RepoRoot
+    Invoke-WorktreeStorageAudit
     Invoke-Step "GitHub write-safety tests" "bash" @("scripts/gh-safe.tests.sh")
     if ($All -or $Format) {
         Invoke-Step "Rust format" "cargo" @("fmt", "--all", "--check")

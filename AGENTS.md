@@ -114,6 +114,15 @@ pnpm run tauri:build
 - Tray / DPAPI / browser-cookie behavior: validate on **Windows-native** hosts. WSL/Linux is insufficient for those paths.
 - **CUA (computer-use) for UI proof** — see [Testing & QA](#testing--qa). Project: [trycua/cua](https://github.com/trycua/cua). On this machine the Windows driver is typically `%LOCALAPPDATA%\Programs\Cua\cua-driver\bin\cua-driver.exe`.
 
+### Worktree storage policy
+
+- Keep source isolation in Git worktrees when branches are edited concurrently. Read-only issue review can use an existing checkout, `git show`, or `git diff` without creating another worktree.
+- Local Cargo builds should load `scripts/worktree-env.ps1`. It sets a process-local `CARGO_TARGET_DIR` outside every registered worktree. Use `WCB_CARGO_TARGET_ROOT` for a temporary machine-local cache root or `WCB_CARGO_TARGET_DIR` for an explicit per-process override.
+- Do not commit a shared writable `target-dir` in `.cargo/config.toml`, set a global `CARGO_TARGET_DIR`, or share one exact target directory between concurrent builds. The source worktree remains isolated; only reproducible build output is redirected.
+- `scripts/worktree-storage.ps1` is read-only. It reports free disk, registered worktrees, worktree-local `target`, `node_modules`, and the configured external Cargo target. Storage warnings are advisory and never delete files, clean Cargo output, switch branches, or prune Git metadata.
+- Treat `target`, Cargo incremental artifacts, frontend build output, and reinstallable `node_modules` as disposable. Preserve source edits, commits, branches, PR history, and review evidence. Before retiring a worktree, verify it is clean and its commit is preserved; removing a worktree does not delete its branch.
+- Use these local warning guides: below 60 GiB free, above 1 GiB per worktree target, or above 5 GiB aggregate worktree targets. Treat below 35 GiB free or above 5 GiB for one target / 10 GiB aggregate as an immediate cleanup review. CircleCI keeps its normal runner-local cache and skips this workstation audit.
+
 
 ## Testing & QA
 
