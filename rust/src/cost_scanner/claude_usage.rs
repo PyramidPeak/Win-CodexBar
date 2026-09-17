@@ -23,7 +23,7 @@ where
     let mut metadata = None;
     for (key, value) in entries {
         if key == "sessionId" || key == "session_id" {
-            if let Some(session_id) = value.as_str() {
+            if let Some(session_id) = value.as_str().filter(|id| !id.trim().is_empty()) {
                 return Some(session_id);
             }
         } else if key == "metadata" {

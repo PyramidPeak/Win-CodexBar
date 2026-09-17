@@ -221,6 +221,7 @@ impl ClaudeEvent {
     fn session_id(&self) -> Option<&str> {
         self.session_id
             .as_deref()
+            .filter(|session_id| !session_id.trim().is_empty())
             .or_else(|| session_id_from_entries(self.extra.iter()))
             .or_else(|| {
                 self.message
