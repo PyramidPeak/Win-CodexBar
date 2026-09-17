@@ -13,6 +13,16 @@ use super::quota_summary;
 use crate::core::{ProviderError, ProviderFetchResult};
 
 const REPORT_TIMEOUT: Duration = Duration::from_secs(90);
+const VERSION_ARGS: [&str; 1] = ["--version"];
+const VERSION_TIMEOUT: Duration = Duration::from_secs(3);
+const USAGE_ARGS: [&str; 6] = [
+    "-p",
+    "/usage",
+    "--output-format",
+    "json",
+    "--print-timeout",
+    "90s",
+];
 const REPORT_MAX_OUTPUT_BYTES: usize = 1_048_576;
 const WORKDIR_CREATE_ATTEMPTS: usize = 8;
 const OAUTH_CREDENTIALS_ENV: &str = "ANTIGRAVITY_OAUTH_CREDENTIALS_JSON";
@@ -106,19 +116,23 @@ where
     })
 }
 
-pub(super) async fn try_fetch(binary: Option<PathBuf>) -> Option<ProviderFetchResult> {
-    let binary = binary?;
+pub(super) async fn try_fetch(
+    binary: Option<PathBuf>,
+) -> Result<Option<ProviderFetchResult>, ProviderError> {
+    let Some(binary) = binary else {
+        return Ok(None);
+    };
     match fetch_print_usage(&binary).await {
-        Ok(usage) => Some(usage),
+        Ok(usage) => Ok(Some(usage)),
         Err(error) => {
             tracing::debug!(%error, "Antigravity structured CLI usage report unavailable");
-            None
+            Err(error)
         }
     }
 }
 
 async fn fetch_print_usage(binary: &Path) -> Result<ProviderFetchResult, ProviderError> {
-    let version = run_cli_command(binary, &["--version"], Duration::from_secs(3)).await?;
+    let version = run_cli_command(binary, &VERSION_ARGS, VERSION_TIMEOUT).await?;
     if version.exceeded_limit {
         return Err(ProviderError::Parse(
             "Antigravity CLI version output is too large".into(),
@@ -131,19 +145,7 @@ async fn fetch_print_usage(binary: &Path) -> Result<ProviderFetchResult, Provide
         ));
     }
 
-    let output = run_cli_command(
-        binary,
-        &[
-            "-p",
-            "/usage",
-            "--output-format",
-            "json",
-            "--print-timeout",
-            "90s",
-        ],
-        REPORT_TIMEOUT,
-    )
-    .await?;
+    let output = run_cli_command(binary, &USAGE_ARGS, REPORT_TIMEOUT).await?;
     if output.exceeded_limit {
         return Err(ProviderError::Parse(
             "Antigravity CLI usage report is too large".into(),
@@ -276,5 +278,51 @@ mod tests {
 
         drop(workdir);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn usage_fallback_uses_exact_noninteractive_command_and_bounded_timeouts() {
+        assert_eq!(VERSION_ARGS, ["--version"]);
+        assert_eq!(
+            USAGE_ARGS,
+            [
+                "-p",
+                "/usage",
+                "--output-format",
+                "json",
+                "--print-timeout",
+                "90s"
+            ]
+        );
+        assert_eq!(VERSION_TIMEOUT, Duration::from_secs(3));
+        assert_eq!(REPORT_TIMEOUT, Duration::from_secs(90));
+
+        let workdir = PrivateWorkdir::create().expect("private working directory");
+        let version_command = prepare_command(Path::new("agy"), &VERSION_ARGS, workdir.path());
+        assert_eq!(
+            version_command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_str())
+                .collect::<Vec<_>>(),
+            vec![Some("--version")]
+        );
+
+        let command = prepare_command(Path::new("agy"), &USAGE_ARGS, workdir.path());
+        let standard_command = command.as_std();
+        assert_eq!(
+            standard_command
+                .get_args()
+                .map(|arg| arg.to_str())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("-p"),
+                Some("/usage"),
+                Some("--output-format"),
+                Some("json"),
+                Some("--print-timeout"),
+                Some("90s")
+            ]
+        );
     }
 }

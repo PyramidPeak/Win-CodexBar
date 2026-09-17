@@ -1,5 +1,9 @@
 use super::legacy_status::{ModelFamily, canonical_model_id, classify_model};
 use super::*;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[test]
 fn cadence_labels_are_owned_by_antigravity_snapshot() {
@@ -532,6 +536,28 @@ fn probe_failure_maps_to_unknown() {
 
 // ── Offline-history fallback on probe failure ──────────────────────
 
+const STRUCTURED_CLI_USAGE_REPORT: &[u8] = br#"{
+  "status": "SUCCESS",
+  "command": {
+    "name": "usage",
+    "data": {
+      "groups": [{
+        "name": "Gemini Models",
+        "buckets": [
+          {"id":"gemini-5h","name":"Five Hour Limit Remaining","remaining_fraction":0.6},
+          {"id":"gemini-weekly","name":"Weekly Limit Remaining","remaining_fraction":0.8}
+        ]
+      }]
+    }
+  }
+}"#;
+
+fn structured_cli_result() -> ProviderFetchResult {
+    let usage = quota_summary::parse_cli_usage_report(STRUCTURED_CLI_USAGE_REPORT)
+        .expect("structured CLI fixture should parse");
+    AntigravityProvider::fetch_result(usage, "cli")
+}
+
 fn offline_result() -> ProviderFetchResult {
     ProviderFetchResult::new(
         UsageSnapshot::new(RateWindow::informational("Offline · 2 conversations"))
@@ -574,6 +600,78 @@ fn non_auth_failure_without_history_surfaces_error() {
         None,
     );
     assert!(matches!(resolved, Err(ProviderError::Other(_))));
+}
+
+#[tokio::test]
+async fn local_probe_success_does_not_run_structured_cli_fallback() {
+    let provider = AntigravityProvider::new();
+    let fallback_called = Arc::new(AtomicBool::new(false));
+    let marker = Arc::clone(&fallback_called);
+    let local = ProviderFetchResult::new(UsageSnapshot::new(RateWindow::new(10.0)), "local");
+
+    let result = provider
+        .resolve_runtime_fallback(Ok(Some(local)), move || async move {
+            marker.store(true, Ordering::SeqCst);
+            Ok(Some(structured_cli_result()))
+        })
+        .await
+        .expect("successful local probe should resolve");
+
+    assert_eq!(result.source_label, "local");
+    assert_eq!(result.usage.primary.used_percent, 10.0);
+    assert!(!fallback_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn local_auth_probe_failure_uses_structured_cli_fallback() {
+    let result = AntigravityProvider::new()
+        .resolve_runtime_fallback(Err(ProviderError::AuthRequired), || async {
+            Ok(Some(structured_cli_result()))
+        })
+        .await
+        .expect("the structured report should recover the local auth-shaped failure");
+
+    assert_eq!(result.source_label, "cli");
+    assert_eq!(result.usage.primary.used_percent, 40.0);
+}
+
+#[tokio::test]
+async fn generic_local_probe_failure_uses_valid_structured_cli_json() {
+    let result = AntigravityProvider::new()
+        .resolve_runtime_fallback(
+            Err(ProviderError::Other("local API unavailable".to_string())),
+            || async { Ok(Some(structured_cli_result())) },
+        )
+        .await
+        .expect("the structured report should recover a generic local failure");
+
+    assert_eq!(result.source_label, "cli");
+    assert_eq!(result.usage.primary.used_percent, 40.0);
+}
+
+#[tokio::test]
+async fn unauthenticated_local_and_unavailable_cli_paths_remain_auth_required() {
+    let result = AntigravityProvider::new()
+        .resolve_runtime_fallback(Err(ProviderError::AuthRequired), || async { Ok(None) })
+        .await;
+
+    assert!(matches!(result, Err(ProviderError::AuthRequired)));
+}
+
+#[tokio::test]
+async fn malformed_structured_cli_json_from_fallback_is_a_parse_error() {
+    let result = AntigravityProvider::new()
+        .resolve_runtime_fallback(Err(ProviderError::AuthRequired), || async {
+            let error = quota_summary::parse_cli_usage_report(br#"{"status":"SUCCESS""#)
+                .expect_err("malformed JSON must fail parsing");
+            Err(error)
+        })
+        .await;
+
+    assert!(
+        matches!(result, Err(ProviderError::Parse(message)) if message
+        .starts_with("Antigravity CLI usage report:"))
+    );
 }
 
 #[test]
