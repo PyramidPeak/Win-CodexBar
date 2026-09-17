@@ -183,7 +183,10 @@ impl AmpProvider {
         })?;
 
         let mut command = Command::new(executable);
-        command.args(["usage"]).env("NO_COLOR", "1");
+        command
+            .args(["usage"])
+            .env("NO_COLOR", "1")
+            .kill_on_drop(true);
         hide_windows_console(&mut command);
         let output = timeout(Duration::from_secs(15), command.output())
             .await
@@ -217,9 +220,14 @@ fn usage_from_amp_cli_output(
     })
 }
 
+#[cfg(windows)]
 fn hide_windows_console(command: &mut Command) {
-    #[cfg(windows)]
     command.creation_flags(0x08000000);
+}
+
+#[cfg(not(windows))]
+fn hide_windows_console(command: &mut Command) {
+    let _ = command;
 }
 
 fn access_token_from_context(ctx: &FetchContext) -> Option<String> {
