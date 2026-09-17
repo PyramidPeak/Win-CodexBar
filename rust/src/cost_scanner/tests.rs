@@ -306,6 +306,16 @@ fn session_id_falls_back_from_blank_direct_id_to_metadata() {
 }
 
 #[test]
+fn session_id_falls_back_from_blank_direct_and_metadata_ids_to_nested_metadata() {
+    let event: ClaudeEvent = serde_json::from_str(
+        r#"{"type":"assistant","sessionId":" ","metadata":{"sessionId":"\t","metadata":{"session_id":"nested-session"}},"message":{"id":"msg_1","model":"claude-sonnet-4-6","usage":{"input_tokens":10}}}"#,
+    )
+    .unwrap();
+
+    assert_eq!(event.session_id(), Some("nested-session"));
+}
+
+#[test]
 fn session_aware_claude_dedup_keeps_distinct_sessions_separate() {
     let first: ClaudeEvent = serde_json::from_str(
         r#"{"type":"assistant","sessionId":"session_a","message":{"id":"msg_1","model":"claude-sonnet-4-6","usage":{"input_tokens":10}}}"#,
