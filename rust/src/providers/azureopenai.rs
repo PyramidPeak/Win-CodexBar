@@ -235,12 +235,12 @@ impl AzureOpenAIProvider {
             serde_json::json!({
                 "model": deployment,
                 "messages": [{"role": "user", "content": "ping"}],
-                "max_completion_tokens": 1
+                "max_completion_tokens": 16
             })
         } else {
             serde_json::json!({
                 "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1
+                "max_tokens": 16
             })
         }
     }
@@ -362,5 +362,28 @@ mod tests {
         assert!(AzureOpenAIProvider::parse_endpoint("http://example.com").is_err());
         assert!(AzureOpenAIProvider::parse_endpoint("https://user@example.com").is_err());
         assert!(AzureOpenAIProvider::parse_endpoint("https://example.com%2f.evil.test").is_err());
+    }
+
+    #[test]
+    fn validation_bodies_use_sixteen_token_budget() {
+        let v1 = AzureOpenAIProvider::validation_body("reasoning-deployment", "v1");
+        assert_eq!(
+            v1.get("max_completion_tokens")
+                .and_then(|value| value.as_u64()),
+            Some(16)
+        );
+
+        let legacy = AzureOpenAIProvider::validation_body("reasoning-deployment", "2024-10-21");
+        assert_eq!(
+            legacy.get("max_tokens").and_then(|value| value.as_u64()),
+            Some(16)
+        );
+    }
+
+    #[test]
+    fn parses_success_response_containing_only_model() {
+        let response: ChatCompletionResponse =
+            serde_json::from_str(r#"{"model":"gpt-5"}"#).unwrap();
+        assert_eq!(response.model.as_deref(), Some("gpt-5"));
     }
 }
