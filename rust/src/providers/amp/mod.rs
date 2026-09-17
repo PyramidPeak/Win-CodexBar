@@ -7,9 +7,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
 use std::path::PathBuf;
-use std::time::Duration;
-use tokio::process::Command;
-use tokio::time::timeout;
+
+mod cli;
 
 use crate::core::{
     FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId, ProviderMetadata,
@@ -170,64 +169,6 @@ impl AmpProvider {
 
         Ok(usage)
     }
-
-    fn find_amp_cli() -> Option<PathBuf> {
-        which::which("amp").ok().filter(|path| path.exists())
-    }
-
-    async fn fetch_via_cli(&self) -> Result<UsageSnapshot, ProviderError> {
-        let executable = Self::find_amp_cli().ok_or_else(|| {
-            ProviderError::NotInstalled(
-                "Amp CLI not found. Install it from https://ampcode.com".to_string(),
-            )
-        })?;
-
-        let mut command = Command::new(executable);
-        command
-            .args(["usage"])
-            .env("NO_COLOR", "1")
-            .kill_on_drop(true);
-        hide_windows_console(&mut command);
-        let output = timeout(Duration::from_secs(15), command.output())
-            .await
-            .map_err(|_| ProviderError::Timeout)?
-            .map_err(|error| ProviderError::Other(format!("Failed to run Amp CLI: {error}")))?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let text = if stdout.trim().is_empty() {
-            stderr.trim()
-        } else {
-            stdout.trim()
-        };
-
-        if !output.status.success() {
-            let lowercase = text.to_ascii_lowercase();
-            if lowercase.contains("login") || lowercase.contains("auth") {
-                return Err(ProviderError::AuthRequired);
-            }
-            return Err(ProviderError::Other(format!("Amp CLI failed: {text}")));
-        }
-        usage_from_amp_cli_output(text, Utc::now())
-    }
-}
-
-fn usage_from_amp_cli_output(
-    text: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<UsageSnapshot, ProviderError> {
-    usage_snapshot_from_amp_display_text(text, now).ok_or_else(|| {
-        ProviderError::Parse("Amp CLI returned unrecognized usage output".to_string())
-    })
-}
-
-#[cfg(windows)]
-fn hide_windows_console(command: &mut Command) {
-    command.creation_flags(0x08000000);
-}
-
-#[cfg(not(windows))]
-fn hide_windows_console(command: &mut Command) {
-    let _ = command;
 }
 
 fn access_token_from_context(ctx: &FetchContext) -> Option<String> {
@@ -277,7 +218,7 @@ impl Provider for AmpProvider {
 
         match ctx.source_mode {
             SourceMode::Auto => {
-                if let Ok(usage) = self.fetch_via_cli().await {
+                if let Ok(usage) = cli::fetch_usage().await {
                     return Ok(ProviderFetchResult::new(usage, "cli"));
                 }
                 let usage = self.fetch_via_web(ctx).await?;
@@ -288,7 +229,7 @@ impl Provider for AmpProvider {
                 Ok(ProviderFetchResult::new(usage, "web"))
             }
             SourceMode::Cli => {
-                let usage = self.fetch_via_cli().await?;
+                let usage = cli::fetch_usage().await?;
                 Ok(ProviderFetchResult::new(usage, "cli"))
             }
             SourceMode::OAuth => Err(ProviderError::UnsupportedSource(SourceMode::OAuth)),
@@ -917,7 +858,7 @@ Subscription Megawatt: 42% other usage and 88% orb usage remaining - resets upon
 orb usage 732.8h of 750h a1.small orb hours remaining - \
 period 2026-09-13 to 2026-10-13, resets upon renewal in 27 days";
 
-        let usage = usage_from_amp_cli_output(text, now).expect("tier CLI output");
+        let usage = super::cli::usage_from_amp_cli_output(text, now).expect("tier CLI output");
         assert_eq!(usage.primary_label.as_deref(), Some("Agent usage"));
         assert_eq!(usage.secondary_label.as_deref(), Some("Orb usage"));
         assert!((usage.primary.used_percent - 7.15).abs() < 0.0001);
