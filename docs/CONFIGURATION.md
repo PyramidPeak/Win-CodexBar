@@ -105,6 +105,28 @@ When credential reading is disabled, active-account status is unknown and every
 saved account remains switchable. The list does not open ambient credential or
 identity files. Explicitly selecting the already-current account is a no-op.
 
+## Grok accounts
+
+In **Settings → Providers → Grok → Grok accounts**, use **Save current
+account** to retain the existing `~/.grok/auth.json` login, or **Add account**
+to run `grok login --oauth` in an isolated `GROK_HOME`. Finish that sign-in in
+the Firefox profile (or browser) for the second SuperGrok account. Adding an
+account leaves the current CLI login active until you **Switch**.
+
+The tray **Grok accounts** submenu provides the same actions. Win-CodexBar
+saves the outgoing login before switching. **Remove** forgets the saved copy;
+it does not log out the active CLI session. Restart running Grok CLI sessions
+after a switch.
+
+Saved logins are protected with the existing Windows DPAPI storage helper under
+`%APPDATA%\CodexBar\grok-accounts\accounts.json`. Sign-in uses a temporary
+`GROK_HOME`; successful, failed, cancelled, and timed-out attempts clean up
+that directory. Switching replaces only `~/.grok/auth.json` (or
+`$GROK_HOME/auth.json` when that environment variable is set). Sessions,
+skills, and other Grok home files stay in place. `XAI_API_KEY` and
+`GROK_OAUTH_TOKEN` are unset for the isolated sign-in so the browser OAuth
+flow is used.
+
 ## Source mode
 
 CLI `--source` values on this port (see `codexbar usage --help`): `auto`, `web`, `cli`, `oauth`.

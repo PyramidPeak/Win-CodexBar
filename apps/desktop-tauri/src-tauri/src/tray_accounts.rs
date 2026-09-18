@@ -20,6 +20,10 @@ pub(crate) enum AccountMenuAction {
     CancelClaudeLogin,
     SwitchClaudeAccount(String),
     SwitchCodexAccount(String),
+    AddGrokAccount,
+    SaveGrokAccount,
+    CancelGrokLogin,
+    SwitchGrokAccount(String),
 }
 
 pub(crate) fn prepend_account_menus(spec: &mut Vec<TrayMenuEntry>, settings: &Settings) {
@@ -45,6 +49,16 @@ pub(crate) fn prepend_account_menus(spec: &mut Vec<TrayMenuEntry>, settings: &Se
             settings.hide_personal_info,
         ),
     );
+
+    let grok_accounts = crate::commands::grok_accounts_list().unwrap_or_default();
+    spec.insert(
+        2,
+        grok_accounts_menu(
+            &grok_accounts,
+            settings.ui_language,
+            settings.hide_personal_info,
+        ),
+    );
 }
 
 pub(crate) fn resolve_action(id: &str) -> Option<AccountMenuAction> {
@@ -53,6 +67,13 @@ pub(crate) fn resolve_action(id: &str) -> Option<AccountMenuAction> {
         "add_claude_account" => Some(AccountMenuAction::AddClaudeAccount),
         "save_claude_account" => Some(AccountMenuAction::SaveClaudeAccount),
         "cancel_claude_login" => Some(AccountMenuAction::CancelClaudeLogin),
+        "add_grok_account" => Some(AccountMenuAction::AddGrokAccount),
+        "save_grok_account" => Some(AccountMenuAction::SaveGrokAccount),
+        "cancel_grok_login" => Some(AccountMenuAction::CancelGrokLogin),
+        _ if id.starts_with("switch_grok_account:") => {
+            let id = id.strip_prefix("switch_grok_account:")?;
+            (!id.is_empty()).then(|| AccountMenuAction::SwitchGrokAccount(id.to_string()))
+        }
         _ if id.starts_with("switch_claude_account:") => {
             let id = id.strip_prefix("switch_claude_account:")?;
             (!id.is_empty()).then(|| AccountMenuAction::SwitchClaudeAccount(id.to_string()))
@@ -118,6 +139,35 @@ pub(crate) fn handle_action(app: &AppHandle, action: AccountMenuAction) {
             });
         }
         AccountMenuAction::CancelClaudeLogin => crate::commands::claude_account_cancel_login(),
+        AccountMenuAction::CancelGrokLogin => crate::commands::grok_account_cancel_login(),
+        action @ (AccountMenuAction::AddGrokAccount
+        | AccountMenuAction::SaveGrokAccount
+        | AccountMenuAction::SwitchGrokAccount(_)) => {
+            let handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                use tauri_plugin_dialog::DialogExt;
+                let (result, message) = match action {
+                    AccountMenuAction::AddGrokAccount => (
+                        crate::commands::grok_account_add(handle.clone()).await,
+                        "Grok account added. Select it to switch.",
+                    ),
+                    AccountMenuAction::SaveGrokAccount => (
+                        crate::commands::grok_account_save_current(handle.clone()).await,
+                        "Current Grok account saved.",
+                    ),
+                    AccountMenuAction::SwitchGrokAccount(id) => (
+                        crate::commands::grok_account_switch(handle.clone(), id).await,
+                        "Grok account switched. Restart Grok CLI sessions to use it.",
+                    ),
+                    _ => unreachable!(),
+                };
+                handle
+                    .dialog()
+                    .message(result.err().unwrap_or_else(|| message.to_string()))
+                    .title("Grok accounts")
+                    .show(|_| {});
+            });
+        }
         action @ (AccountMenuAction::AddClaudeAccount
         | AccountMenuAction::SaveClaudeAccount
         | AccountMenuAction::SwitchClaudeAccount(_)) => {
@@ -263,6 +313,58 @@ fn claude_accounts_menu(
     )
 }
 
+fn grok_accounts_menu(
+    accounts: &[codexbar::providers::grok::accounts::GrokAccount],
+    lang: Language,
+    hide_personal_info: bool,
+) -> TrayMenuEntry {
+    let text = |key| locale::get_text(lang, key);
+    let mut children: Vec<_> = accounts
+        .iter()
+        .map(|account| {
+            let label = if hide_personal_info {
+                codexbar::core::PersonalInfoRedactor::partial_redact_email(
+                    Some(&account.email),
+                    true,
+                )
+            } else {
+                account.email.clone()
+            };
+            let mut entry = TrayMenuEntry::check_item(
+                format!("switch_grok_account:{}", account.id),
+                label,
+                account.is_active,
+            );
+            entry.disabled = account.is_active || !account.is_saved;
+            entry
+        })
+        .collect();
+    if children.is_empty() {
+        children.push(TrayMenuEntry::status_row(
+            "grok_accounts_empty",
+            text(LocaleKey::GrokAccountsEmpty),
+        ));
+    }
+    children.push(TrayMenuEntry::separator());
+    children.push(TrayMenuEntry::item(
+        "add_grok_account",
+        text(LocaleKey::CodexAccountsAddButton),
+    ));
+    children.push(TrayMenuEntry::item(
+        "save_grok_account",
+        text(LocaleKey::GrokAccountsSaveCurrent),
+    ));
+    children.push(TrayMenuEntry::item(
+        "cancel_grok_login",
+        text(LocaleKey::GrokAccountsCancelLogin),
+    ));
+    TrayMenuEntry::submenu(
+        "grok_accounts",
+        text(LocaleKey::GrokAccountsTitle),
+        children,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +396,15 @@ mod tests {
         );
         assert!(resolve_action("switch_claude_account:").is_none());
         assert!(resolve_action("switch_codex_account:not-a-uuid").is_none());
+        assert_eq!(
+            resolve_action("add_grok_account"),
+            Some(AccountMenuAction::AddGrokAccount)
+        );
+        assert_eq!(
+            resolve_action("switch_grok_account:user-two"),
+            Some(AccountMenuAction::SwitchGrokAccount("user-two".into()))
+        );
+        assert!(resolve_action("switch_grok_account:").is_none());
     }
 
     #[test]
@@ -445,6 +556,39 @@ mod tests {
         assert!(menu_contains(
             &claude_accounts_menu(&[], Language::English, false).children,
             "add_claude_account"
+        ));
+    }
+
+    #[test]
+    fn grok_menu_checks_current_account_and_routes_saved_accounts() {
+        use codexbar::providers::grok::accounts::GrokAccount;
+        let current = GrokAccount {
+            id: "user-a".into(),
+            email: "a@example.com".into(),
+            organization: None,
+            plan: Some("SuperGrok".into()),
+            is_active: true,
+            is_saved: false,
+        };
+        let saved = GrokAccount {
+            id: "user-b".into(),
+            is_active: false,
+            is_saved: true,
+            ..current.clone()
+        };
+        let menu = grok_accounts_menu(&[current, saved], Language::English, false);
+        assert_eq!(menu.id.as_deref(), Some("grok_accounts"));
+        assert_eq!(menu.children[0].checked, Some(true));
+        assert!(menu.children[0].disabled);
+        assert_eq!(
+            menu.children[1].id.as_deref(),
+            Some("switch_grok_account:user-b")
+        );
+        assert!(!menu.children[1].disabled);
+        assert!(menu_contains(&menu.children, "add_grok_account"));
+        assert!(menu_contains(
+            &grok_accounts_menu(&[], Language::English, false).children,
+            "add_grok_account"
         ));
     }
 }

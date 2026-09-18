@@ -4036,6 +4036,14 @@ html:has(.menu-surface--tray) {
   background: var(--accent, currentColor);
 }
 
+.codex-menu-accounts__bar-fill[data-level="critical"] {
+  background: var(--usage-bar-critical, var(--accent));
+}
+
+.codex-menu-accounts__bar-fill[data-level="exhausted"] {
+  background: var(--usage-bar-exhausted, var(--accent));
+}
+
 .codex-menu-accounts__switch {
   flex-shrink: 0;
   font-size: 0.68rem;

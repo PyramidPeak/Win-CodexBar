@@ -12,6 +12,7 @@ import { providerSupportsChartData } from "../lib/providerCharts";
 import MenuCardDetails, { describeCard, type MetricEntry } from "./MenuCardDetails";
 import CodexAccountsMenu from "./CodexAccountsMenu";
 import ClaudeAccountsMenu from "./ClaudeAccountsMenu";
+import GrokAccountsMenu from "./GrokAccountsMenu";
 import { DEEPSEEK_PRICING_EVENT } from "../hooks/useDeepSeekPricingStatus";
 import { getDeepSeekPricingStatus } from "../lib/tauri";
 import type { DeepSeekPricingStatus } from "../types/bridge";
@@ -292,6 +293,13 @@ export default function MenuCard({
       )}
       {provider.providerId === "claude" && (
         <ClaudeAccountsMenu hideEmail={hideEmail} onLayoutChange={onLayoutChange} />
+      )}
+      {provider.providerId === "grok" && (
+        <GrokAccountsMenu
+          hideEmail={hideEmail}
+          resetTimeRelative={resetTimeRelative}
+          onLayoutChange={onLayoutChange}
+        />
       )}
 
       {hasDetails && <div className="menu-card__divider" />}

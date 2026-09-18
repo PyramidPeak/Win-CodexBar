@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Grok: Settings and tray **Add account** flow matching Codex/Claude — isolated `grok login --oauth`, save current CLI login, switch, and remove without logging out the active session.
+
+---
+
 ## [Windows] 0.60.3 - 2026-09-15
 
 Windows port of upstream CodexBar **0.56.8 → 0.60.3**.

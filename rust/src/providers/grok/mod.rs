@@ -3,6 +3,7 @@
 //! Uses the grok.com billing gRPC-web endpoint via either browser cookies or
 //! `~/.grok/auth.json` produced by `grok login`.
 
+pub mod accounts;
 mod billing;
 pub mod local_sessions;
 
@@ -68,6 +69,32 @@ impl GrokProvider {
             ProviderError::NotInstalled("Grok auth.json not found. Run `grok login`.".to_string())
         })?;
         GrokCredentials::parse_for_kind(&text, kind)
+    }
+
+    pub async fn fetch_usage_from_auth_json(
+        &self,
+        text: &str,
+    ) -> Result<crate::providers::grok::accounts::GrokAccountUsage, ProviderError> {
+        let (credentials, kind) =
+            if let Ok(credentials) = GrokCredentials::parse_for_kind(text, GrokAuthKind::OAuth) {
+                (credentials, GrokAuthKind::OAuth)
+            } else {
+                (
+                    GrokCredentials::parse_for_kind(text, GrokAuthKind::Cli)?,
+                    GrokAuthKind::Cli,
+                )
+            };
+        let result = self.fetch_with_auth(&credentials, kind).await?;
+        Ok(crate::providers::grok::accounts::GrokAccountUsage {
+            used_percent: Some(result.usage.primary.used_percent),
+            plan: result
+                .usage
+                .login_method
+                .clone()
+                .or(result.usage.primary_label.clone()),
+            window_minutes: result.usage.primary.window_minutes,
+            resets_at: result.usage.primary.resets_at,
+        })
     }
 
     async fn fetch_with_auth(

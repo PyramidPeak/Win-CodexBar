@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ClaudeAccount,
+  GrokAccount,
+  GrokAccountUsage,
   ClaudeSwapAccountsState,
   ApiKeyInfoBridge,
   ApiKeyProviderInfoBridge,
@@ -50,6 +52,14 @@ export const claudeAccountCancelLogin = () => invoke<void>("claude_account_cance
 export const claudeAccountSaveCurrent = () => invoke<void>("claude_account_save_current");
 export const claudeAccountRemove = (id: string) => invoke<void>("claude_account_remove", { id });
 export const claudeAccountSwitch = (id: string) => invoke<void>("claude_account_switch", { id });
+export const grokAccountsList = () => invoke<GrokAccount[]>("grok_accounts_list");
+export const grokAccountAdd = () => invoke<void>("grok_account_add");
+export const grokAccountCancelLogin = () => invoke<void>("grok_account_cancel_login");
+export const grokAccountSaveCurrent = () => invoke<void>("grok_account_save_current");
+export const grokAccountRemove = (id: string) => invoke<void>("grok_account_remove", { id });
+export const grokAccountSwitch = (id: string) => invoke<void>("grok_account_switch", { id });
+export const grokAccountFetch = (id: string) =>
+  invoke<GrokAccountUsage>("grok_account_fetch", { id });
 export const claudeSwapAccountsList = () =>
   invoke<ClaudeSwapAccountsState>("claude_swap_accounts_list");
 export const claudeSwapAccountSwitch = (slot: number) =>

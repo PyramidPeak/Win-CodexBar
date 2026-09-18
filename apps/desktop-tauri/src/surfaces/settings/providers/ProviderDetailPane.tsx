@@ -36,6 +36,7 @@ import { RegionSection } from "./sections/RegionSection";
 import { CodexUsageOptions } from "./sections/credentials/CodexUsageOptions";
 import { CodexAccountsSection } from "./sections/credentials/CodexAccountsSection";
 import { ClaudeAccountsSection } from "./sections/credentials/ClaudeAccountsSection";
+import { GrokAccountsSection } from "./sections/credentials/GrokAccountsSection";
 import { TokenAccountsPanel } from "../tokens/TokenAccountsPanel";
 import { ApiKeySection } from "./ApiKeySection";
 import { CookieSection } from "./CookieSection";
@@ -270,6 +271,7 @@ export function ProviderDetailPane({
 
       {detail.id === "codex" && <CodexAccountsSection t={t} />}
       {detail.id === "claude" && <ClaudeAccountsSection t={t} language={language} />}
+      {detail.id === "grok" && <GrokAccountsSection t={t} />}
 
       {detail.lastError && (
         <ProviderIssueNotice detail={detail} t={t} />
