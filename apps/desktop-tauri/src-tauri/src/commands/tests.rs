@@ -393,6 +393,47 @@ fn fetch_context_grok_empty_manual_preserves_oauth_without_browser_import() {
 }
 
 #[test]
+fn fetch_context_grok_manual_cookie_keeps_auto_for_switched_login() {
+    let mut settings = Settings::default();
+    settings.set_cookie_source(ProviderId::Grok, "manual");
+    settings.set_usage_source(ProviderId::Grok, "auto");
+    let mut cookies = ManualCookies::default();
+    cookies.set("grok", "sso=other-account");
+    let ctx = super::build_fetch_context(
+        ProviderId::Grok,
+        &settings,
+        &cookies,
+        &ApiKeys::default(),
+        &HashMap::new(),
+    );
+
+    assert_eq!(ctx.source_mode, SourceMode::Auto);
+    assert_eq!(ctx.manual_cookie_header.as_deref(), Some("sso=other-account"));
+}
+
+#[test]
+fn fetch_context_grok_explicit_web_still_uses_manual_cookie() {
+    let mut settings = Settings::default();
+    settings.set_cookie_source(ProviderId::Grok, "manual");
+    settings.set_usage_source(ProviderId::Grok, "web");
+    let mut cookies = ManualCookies::default();
+    cookies.set("grok", "sso=browser-account");
+    let ctx = super::build_fetch_context(
+        ProviderId::Grok,
+        &settings,
+        &cookies,
+        &ApiKeys::default(),
+        &HashMap::new(),
+    );
+
+    assert_eq!(ctx.source_mode, SourceMode::Web);
+    assert_eq!(
+        ctx.manual_cookie_header.as_deref(),
+        Some("sso=browser-account")
+    );
+}
+
+#[test]
 fn fetch_context_opencode_empty_manual_remaps_to_web() {
     let settings = Settings::default();
     let cookies = ManualCookies::default();

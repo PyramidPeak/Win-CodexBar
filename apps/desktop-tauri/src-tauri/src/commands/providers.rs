@@ -125,6 +125,17 @@ pub(crate) fn build_fetch_context(
                     && usage_source == SourceMode::Auto
                 {
                     SourceMode::Auto
+                } else if let Some(mode) = grok_source_mode_for_manual_cookie(
+                    id,
+                    usage_source,
+                    cookie_header
+                        .as_deref()
+                        .is_some_and(|cookie| !cookie.trim().is_empty()),
+                ) {
+                    // Grok Switch writes ~/.grok/auth.json. Leftover grok.com
+                    // cookies must not force Web, or Weekly/notifications keep
+                    // showing the previous browser account.
+                    mode
                 } else if cookie_header.is_some() {
                     SourceMode::Web
                 } else if provider_uses_oauth_without_cookies(id, usage_source) {
@@ -199,6 +210,25 @@ fn provider_uses_oauth_without_cookies(id: ProviderId, usage_source: SourceMode)
         ProviderId::Claude => usage_source != SourceMode::Cli,
         ProviderId::Grok => matches!(usage_source, SourceMode::Auto | SourceMode::OAuth),
         _ => false,
+    }
+}
+
+/// Keep Grok Auto/OAuth/Cli on the switched login instead of rewriting a
+/// leftover manual cookie as Web. Empty Auto still maps to OAuth so we do
+/// not scrape the browser.
+fn grok_source_mode_for_manual_cookie(
+    id: ProviderId,
+    usage_source: SourceMode,
+    has_cookie: bool,
+) -> Option<SourceMode> {
+    if id != ProviderId::Grok {
+        return None;
+    }
+    match usage_source {
+        SourceMode::Cli => Some(SourceMode::Cli),
+        SourceMode::Auto if has_cookie => Some(SourceMode::Auto),
+        SourceMode::Auto | SourceMode::OAuth => Some(SourceMode::OAuth),
+        _ => None,
     }
 }
 

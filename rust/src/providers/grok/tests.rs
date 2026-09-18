@@ -52,6 +52,28 @@ fn cli_and_oauth_select_distinct_auth_entries() {
     );
 }
 #[test]
+fn auto_tries_switched_login_before_cookies() {
+    assert_eq!(
+        grok_auto_steps(true, true),
+        vec![
+            GrokAutoStep::AmbientOAuth,
+            GrokAutoStep::AmbientCli,
+            GrokAutoStep::ApiKey,
+            GrokAutoStep::ManualCookie,
+            GrokAutoStep::CookieRefresh,
+        ]
+    );
+    assert_eq!(
+        grok_auto_steps(false, false),
+        vec![
+            GrokAutoStep::AmbientOAuth,
+            GrokAutoStep::AmbientCli,
+            GrokAutoStep::CookieRefresh,
+        ]
+    );
+}
+
+#[test]
 fn cookie_refresh_uses_cache_when_present() {
     assert_eq!(
         cookie_refresh_action(true, None),
