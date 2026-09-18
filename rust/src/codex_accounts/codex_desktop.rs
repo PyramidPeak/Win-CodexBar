@@ -171,8 +171,15 @@ $codexProcesses = Get-CimInstance Win32_Process | Where-Object {{
 foreach ($process in $codexProcesses) {{
     if (-not (Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue)) {{ continue }}
     Write-Log ("Stopping Desktop GUI process " + $process.ProcessId)
+    # Killing the first GUI PID often reaps sibling renderer PIDs. taskkill
+    # then prints "process not found"; with $ErrorActionPreference=Stop that
+    # used to abort before session restore, so Switch never reached Desktop.
+    $previousEap = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
     & taskkill.exe /PID $process.ProcessId /F 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0 -and (Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue)) {{
+    $killExit = $LASTEXITCODE
+    $ErrorActionPreference = $previousEap
+    if ($killExit -ne 0 -and (Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue)) {{
         throw 'Unable to stop Codex Desktop. Session files were left unchanged.'
     }}
 }}
@@ -408,6 +415,97 @@ if (-not $script:stopped -or -not $script:launched) {{ throw 'Restart did not co
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn restart_continues_when_a_sibling_gui_pid_is_already_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::file_locations::with_app_support_directory(dir.path().join("support"));
+        let package = dir.path().join("package");
+        std::fs::create_dir_all(package.join("app")).unwrap();
+        std::fs::write(package.join("app/ChatGPT.exe"), b"fixture").unwrap();
+        std::fs::write(
+            package.join("AppxManifest.xml"),
+            r#"<Package><Applications><Application Id="App" Executable="app/ChatGPT.exe" /></Applications></Package>"#,
+        )
+        .unwrap();
+        let session = dir.path().join("session");
+        let backup = dir.path().join("backup");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("Preferences"), b"old preferences").unwrap();
+        let script = format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+$fixturePackage = {package}
+$launcher = Join-Path $fixturePackage 'app\ChatGPT.exe'
+$script:killed = @()
+function Get-AppxPackage {{ [pscustomobject]@{{ InstallLocation = $fixturePackage; Version = '1.0' }} }}
+function Get-CimInstance {{
+    if ($script:killed -contains 222) {{ return }}
+    [pscustomobject]@{{ ExecutablePath = $launcher; ProcessId = 111; Name = 'ChatGPT.exe' }}
+    [pscustomobject]@{{ ExecutablePath = $launcher; ProcessId = 222; Name = 'ChatGPT.exe' }}
+}}
+function taskkill.exe {{
+    if ($args -contains '/T') {{ throw 'Process-tree shutdown would kill the restart helper' }}
+    $target = $args[1]
+    $script:killed += $target
+    if ($target -eq 111) {{
+        $global:LASTEXITCODE = 0
+        return
+    }}
+    if ($target -eq 222) {{
+        $global:LASTEXITCODE = 128
+        Write-Error 'ERROR: The process "222" not found.'
+        return
+    }}
+    throw 'Unexpected pid'
+}}
+function Get-Process {{
+    param($Id)
+    if ($script:killed -contains 222) {{ return }}
+    [pscustomobject]@{{ Id = $Id }}
+}}
+function Start-Sleep {{}}
+function Start-Process {{ param($FilePath)
+    if ($FilePath -ne $launcher) {{ throw 'Wrong launcher' }}
+    $script:launched = $true
+}}
+{restart}
+if ($script:killed.Count -lt 1) {{ throw 'Did not attempt to stop GUI processes' }}
+if (-not $script:launched) {{ throw 'Restart aborted before relaunch' }}
+"#,
+            package = powershell_literal_path(&package),
+            restart = build_restart_script(
+                0.0,
+                Some(&session),
+                Some(&backup),
+                Some(&dir.path().join("missing-target"))
+            )
+        );
+        super::super::file_locations::clear_app_support_directory_override();
+        let path = dir.path().join("test-restart-gone-pid.ps1");
+        std::fs::write(&path, script).unwrap();
+        let argv = build_restart_command(&path);
+        let output = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .unwrap();
+        let log = std::fs::read_to_string(dir.path().join("support/codex-desktop-restart.log"))
+            .unwrap_or_default();
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={} log={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            log
+        );
+        assert!(!session.join("Preferences").exists());
+        assert_eq!(
+            std::fs::read(backup.join("Preferences")).unwrap(),
+            b"old preferences"
+        );
+    }
+
     #[test]
     fn build_restart_script_includes_restart_flow() {
         let script = build_restart_script(1.25, None, None, None);
@@ -415,6 +513,7 @@ if (-not $script:stopped -or -not $script:launched) {{ throw 'Restart did not co
         assert!(script.contains("Get-CimInstance Win32_Process"));
         assert!(script.contains("Get-AppxPackage"));
         assert!(script.contains("taskkill.exe /PID"));
+        assert!(script.contains("$ErrorActionPreference = 'SilentlyContinue'"));
         assert!(script.contains("$manifest.Package.Applications.Application"));
         assert!(script.contains("$_.ExecutablePath -ieq $launcherPath"));
         assert!(!script.contains("$_.Name -ieq 'Codex.exe'"));
