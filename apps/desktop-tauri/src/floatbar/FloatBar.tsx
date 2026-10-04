@@ -234,8 +234,10 @@ function ProviderPill({
     : informational
       ? infoText
       : `${Math.round(displayPercent)}%`;
+  // Only percentages size the warning placeholder; informational text would
+  // widen the pill after an error.
   const lastPercentageLabel = useRef("0%");
-  if (!state.isProblem) lastPercentageLabel.current = label;
+  if (!state.isProblem && !informational) lastPercentageLabel.current = label;
   const resetText = useFormattedResetTime(
     rateWindow.resetsAt,
     informational ? null : resetDescriptionFallback(rateWindow),

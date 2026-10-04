@@ -54,6 +54,8 @@ pub fn get_claude_accounts_state(
         return Ok(accounts);
     }
     let accounts = super::claude_accounts_list()?;
+    let allow_reading_credentials =
+        codexbar::settings::Settings::load().claude_allow_reading_claude_code_credentials;
     let state = state.lock().map_err(|e| e.to_string())?;
     Ok(accounts
         .into_iter()
@@ -63,7 +65,7 @@ pub fn get_claude_accounts_state(
                 .get(&account.id)
                 .cloned()
                 .unwrap_or_default();
-            if !codexbar::settings::Settings::load().claude_allow_reading_claude_code_credentials {
+            if !allow_reading_credentials {
                 usage = ClaudeAccountUsageState { usage: None, usage_error: Some(
                     "Enable Allow reading Claude Code's credentials in Settings to check saved accounts.".into()
                 ), needs_authentication: false };

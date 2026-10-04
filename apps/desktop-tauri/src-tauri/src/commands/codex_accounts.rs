@@ -739,11 +739,12 @@ pub struct CodexAccountsStateBridge {
 pub fn get_codex_accounts_state(
     state: tauri::State<'_, Mutex<AppState>>,
 ) -> Result<CodexAccountsStateBridge, String> {
-    let guard = state.lock().map_err(|e| e.to_string())?;
+    // Disk reads first, so refresh lanes and the tray don't wait on them.
     let accounts = load_codex_accounts()?;
     let display_names = display_names_by_id(&accounts);
     let account_ordinals = ordinals_by_id(&accounts);
     let snapshots = snapshots_for_accounts(&accounts, codex_account_snapshots()?);
+    let guard = state.lock().map_err(|e| e.to_string())?;
     let needs_authentication = guard
         .codex_account_needs_authentication
         .iter()

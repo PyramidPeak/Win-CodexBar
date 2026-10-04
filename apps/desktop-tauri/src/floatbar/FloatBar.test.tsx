@@ -649,6 +649,24 @@ describe("FloatBar", () => {
     });
   });
 
+  it("keeps a percentage-sized placeholder after informational text", async () => {
+    tauriMocks.getCachedProviders.mockResolvedValue([
+      snapshot("codex", "Codex", 0, { informational: true, resetDescription: "Unlimited plan" }),
+    ]);
+    tauriMocks.getSettingsSnapshot.mockResolvedValue(settings({ enabledProviders: ["codex"] }));
+    const { container } = renderFloatBar(bootstrap({ enabledProviders: ["codex"] }));
+    await waitFor(() => expect(container.querySelector(".floatbar__pct")?.textContent).toBe("Unlimited plan"));
+    const updated = eventMocks.listen.mock.calls.find(([name]) => name === "provider-updated")?.[1];
+    await act(async () => {
+      updated({ payload: snapshot("codex", "Codex", 0, { errorState: "expiredSession", error: "expired" }) });
+    });
+    await waitFor(() => {
+      const pct = container.querySelector(".floatbar__pct");
+      expect(pct?.getAttribute("aria-label")).toBe("Session expired");
+      expect(pct?.querySelector<HTMLElement>("span[aria-hidden]")?.textContent).toBe("0%");
+    });
+  });
+
   it("applies warning tone when remaining drops below the high threshold", async () => {
     // highUsageThreshold = 70 → high-remaining cutoff = 30%.
     // claude at 80% used → 20% remaining → critical (also below crit cutoff 10).
