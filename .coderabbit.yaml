@@ -1,0 +1,102 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit is the first-pass reviewer for every PR, including drafts and
+# fork PRs. CircleCI pr-check runs the builds and tests. Fork PRs are checked
+# with main's -Slice ci steps in an isolated, credential-free Windows
+# environment (.github/CI.md). UI proof on a real
+# Windows build stays a human or agent responsibility (AGENTS.md).
+language: en-US
+reviews:
+  profile: assertive
+  # Approve once every comment is resolved and no error-mode check fails;
+  # request changes otherwise. Maintainers still merge.
+  request_changes_workflow: true
+  high_level_summary: true
+  auto_review:
+    enabled: true
+    drafts: true
+    auto_incremental_review: true
+  path_instructions:
+    - path: "rust/src/providers/**"
+      instructions: >-
+        Provider-specific logic must stay inside its own provider module. Flag
+        fetch or parse changes that come without deterministic samples or
+        fixtures. Flag any provider that reads, shows, or stores identity,
+        plan, or email belonging to another provider.
+    - path: "rust/src/core/provider_factory.rs"
+      instructions: >-
+        This is the only provider factory. Flag any second factory or
+        provider construction added in the Tauri shell or the CLI.
+    - path: "apps/desktop-tauri/src/types/bridge.ts"
+      instructions: >-
+        These DTOs must match the Rust command payloads field for field
+        (names, optionality, enum strings). Check the matching structs under
+        apps/desktop-tauri/src-tauri/src/commands and flag any drift.
+    - path: "apps/desktop-tauri/src-tauri/src/surface_target.rs"
+      instructions: >-
+        The settings tab whitelist must stay exactly: general, providers,
+        notifications, menuBar, menu, usageSpend, advanced, about. It must
+        mirror the frontend SettingsTabId and TAB_META.
+    - path: "apps/desktop-tauri/src-tauri/src/floatbar/**"
+      instructions: >-
+        The float bar window builder must keep
+        .theme(Some(tauri::Theme::Dark)); an unpinned theme flips other
+        WebView2 windows under theme auto.
+    - path: ".github/workflows/**"
+      instructions: >-
+        Treat workflow changes as security-sensitive. Flag
+        pull_request_target jobs that check out or execute PR code, broad
+        permissions, secrets exposed to fork code, and any automatic trigger
+        added to the manual Blacksmith reserve workflow.
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+    title:
+      mode: warning
+      requirements: >-
+        Short imperative summary of the change, for example "Fix Claude CLI
+        parser" or "Improve cookie import errors".
+    description:
+      mode: warning
+    custom_checks:
+      - name: Provider data stays siloed
+        mode: error
+        instructions: >-
+          Fail if the change can show, log, persist, or send identity, plan,
+          account label, or email from one provider (or one account) in
+          another provider's or account's UI, payload, or storage, or if it
+          adds cross-provider branching (matching on specific ProviderId
+          values) in shared code outside rust/src/providers/<name>/ and
+          rust/src/core/provider_factory.rs. Pass otherwise.
+      - name: Secrets handled safely
+        mode: error
+        instructions: >-
+          Fail if any token, cookie, API key, OAuth credential, or
+          authorization header can reach a log line (tracing macros,
+          println, console.*), an error message shown to the user, a test
+          snapshot, or a plain-text file. Secrets must go through the
+          existing redaction, secure_file, or keyring helpers. Fail if the
+          change deletes or overwrites credential files or keyring entries
+          that belong to another application (for example Claude Code or
+          Codex CLI logins) without an explicit user action. Pass otherwise.
+      - name: No unapproved dependencies
+        mode: error
+        instructions: >-
+          Fail if the change adds a dependency to any Cargo.toml or
+          package.json, adds an npm or yarn lockfile, or changes the pinned
+          pnpm packageManager version, unless the PR description says a
+          maintainer approved that addition. Version bumps of existing
+          dependencies only warn. Pass otherwise.
+      - name: UI changes include Windows proof
+        mode: warning
+        instructions: >-
+          If the change alters what a user sees (files under
+          apps/desktop-tauri/src outside *.test.* files, tray rendering in
+          rust/src/tray, the float bar, settings, or window chrome), the PR
+          description must include screenshots or a proof note from a fresh
+          Windows build. Fail if it does not. Pass for changes with no
+          visible effect.
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "**/AGENTS.md"

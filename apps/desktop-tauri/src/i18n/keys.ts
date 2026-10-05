@@ -381,6 +381,8 @@ export const ALL_LOCALE_KEYS = [
   "ClaudeSwapDisabled",
   "CodexAccountsHint",
   "CodexAccountsAddButton",
+  "CodexAccountsSignInButton",
+  "CodexAccountsSigningIn",
   "CodexAccountsReauthenticateButton",
   "CodexAccountsSwitchButton",
   "CodexAccountsFetchButton",

@@ -17,7 +17,7 @@ if [[ "${FAKE_GH_MODE:-ok}" == cross ]]; then
   exit 0
 fi
 if [[ "${1:-}" == repo && "${2:-}" == view ]]; then
-  printf '%s\n' 'nesszer/Win-CodexBar|https://github.com/nesszer/Win-CodexBar'
+  printf '%s\n' "${3:?}|https://github.com/${3:?}"
 elif [[ "${1:-}" == pr && "${2:-}" == view ]]; then
   printf '%s\n' 'https://github.com/nesszer/Win-CodexBar/pull/361'
 elif [[ "${1:-}" == issue && "${2:-}" == view ]]; then
@@ -51,6 +51,22 @@ expect_fail bash "$repo_root/scripts/gh-safe.sh" \
 
 expect_fail bash "$repo_root/scripts/gh-safe.sh" \
   --repo other/repo --verify-kind repo --what-if -- \
+  pr create --title test --body test
+
+bash "$repo_root/scripts/gh-safe.sh" \
+  --repo microsoft/winget-pkgs --verify-kind repo --what-if -- \
+  pr create --head Finesssee:test --title test --body test >/dev/null
+
+bash "$repo_root/scripts/gh-safe.sh" \
+  --repo Finesssee/winget-pkgs --verify-kind repo --what-if -- \
+  api repos/Finesssee/winget-pkgs/merge-upstream -X POST -f branch=master >/dev/null
+
+expect_fail bash "$repo_root/scripts/gh-safe.sh" \
+  --repo Finesssee/winget-pkgs --verify-kind repo --what-if -- \
+  api repos/microsoft/winget-pkgs/git/refs -X POST -f ref=refs/heads/test
+
+expect_fail bash "$repo_root/scripts/gh-safe.sh" \
+  --repo other/winget-pkgs --verify-kind repo --what-if -- \
   pr create --title test --body test
 
 expect_fail bash "$repo_root/scripts/gh-safe.sh" \

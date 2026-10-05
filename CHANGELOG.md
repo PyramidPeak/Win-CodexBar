@@ -7,6 +7,12 @@
 
 # Changelog
 
+## [Windows] Unreleased
+
+- Show independent session and weekly usage for native saved Claude Code accounts, with account-scoped OAuth renewal and safe authentication warnings.
+- Offer Refresh login beside Switch only for Claude and Codex accounts that need sign-in. Repair the selected saved login without switching to another account.
+- Use expanded, collapsible Claude and Codex account sections with Add account below the rows; keep the floating bar's usage footprint when authentication expires.
+
 ## [Windows] 0.70.0 - 2026-10-03
 
 Windows port of upstream CodexBar **0.60.3 → 0.70.0**: every provider, cost/usage, privacy, tray, CLI and reliability port from upstream 0.60.4 through 0.70.0 integrated across the release branch, plus six community pull requests and fixes for open issues. This is also the first release to ship the changes in the unreleased 0.61.0 changelog section.
@@ -49,6 +55,16 @@ Windows port of upstream CodexBar **0.60.3 → 0.70.0**: every provider, cost/us
 - Browser cookies: Chrome Beta, Dev, Canary, Chrome for Testing and Chromium profiles as cookie sources, contributed by @ciltocruz ([#614](https://github.com/nesszer/Win-CodexBar/pull/614)).
 - Metrics: Codex reset-credit count and next expiry in `serve --metrics`, with Grafana dashboard, scrape and alert examples, contributed by @le-shi ([#623](https://github.com/nesszer/Win-CodexBar/pull/623)).
 - CLI: `usage` and serve `/usage` follow the enabled providers; `config providers --json`; `-p/--provider` on config subcommands; `config claude-code-credentials allow|deny|status`; `serve --request-timeout`; `CODEXBAR_CONFIG`; and an `errorKind` on JSON error rows ([#640](https://github.com/nesszer/Win-CodexBar/issues/640)).
+- Providers: port CodeRabbit CLI usage, Hugging Face billing usage, Muse Code subscription usage, Nous Portal subscription credits, and Venice web subscription credits ([#566](https://github.com/nesszer/Win-CodexBar/pull/566), [#567](https://github.com/nesszer/Win-CodexBar/pull/567), [#568](https://github.com/nesszer/Win-CodexBar/pull/568), [#569](https://github.com/nesszer/Win-CodexBar/pull/569), [#570](https://github.com/nesszer/Win-CodexBar/pull/570)).
+- Providers: port Amp Tier usage with pacing, Devin quota fallback and diagnostics, Mistral subscription allowances, and Azure OpenAI API-version settings ([#515](https://github.com/nesszer/Win-CodexBar/pull/515), [#522](https://github.com/nesszer/Win-CodexBar/pull/522), [#559](https://github.com/nesszer/Win-CodexBar/pull/559), [#558](https://github.com/nesszer/Win-CodexBar/pull/558)).
+- Providers: port Cursor team budgets, Codex/Claude source-policy fixes, the transient provider detail carrier, and transient provider inventory plumbing ([#545](https://github.com/nesszer/Win-CodexBar/pull/545), [#541](https://github.com/nesszer/Win-CodexBar/pull/541), [#564](https://github.com/nesszer/Win-CodexBar/pull/564), [#560](https://github.com/nesszer/Win-CodexBar/pull/560)).
+- Usage & Spend: add share filtering and export fixes, local timezone windows, and Copilot seat credit fallback ([#549](https://github.com/nesszer/Win-CodexBar/pull/549), [#551](https://github.com/nesszer/Win-CodexBar/pull/551)).
+- Usage & Spend: add usage updated hooks, provider usage item visibility, compact and detailed Overview layouts, and Overview PNG sharing ([#575](https://github.com/nesszer/Win-CodexBar/pull/575), [#578](https://github.com/nesszer/Win-CodexBar/pull/578), [#579](https://github.com/nesszer/Win-CodexBar/pull/579), [#581](https://github.com/nesszer/Win-CodexBar/pull/581)).
+- Cost: add SSH Codex cost comparison, OpenCodex recorded-provider pricing, Claude session-aware dedup, and cached Codex pricing recovery from source ([#577](https://github.com/nesszer/Win-CodexBar/pull/577), [#516](https://github.com/nesszer/Win-CodexBar/pull/516), [#517](https://github.com/nesszer/Win-CodexBar/pull/517), [#576](https://github.com/nesszer/Win-CodexBar/pull/576)).
+- Accounts: add Grok multi-account persistence and usage UI, and managed-home dedup on account switches ([#538](https://github.com/nesszer/Win-CodexBar/pull/538), [#563](https://github.com/nesszer/Win-CodexBar/pull/563)).
+- Claude: keep usage and saved accounts through transient OAuth failures, use validated Claude provider windows, and preserve probe settings for usage probes ([#537](https://github.com/nesszer/Win-CodexBar/pull/537), [#572](https://github.com/nesszer/Win-CodexBar/pull/572)).
+- Tray: add an optional Always on top setting for the tray flyout ([#527](https://github.com/nesszer/Win-CodexBar/pull/527)).
+- Serve: add a Prometheus metrics endpoint with maintainable module structure ([#528](https://github.com/nesszer/Win-CodexBar/pull/528)).
 
 ### Fixed
 
@@ -88,6 +104,12 @@ Windows port of upstream CodexBar **0.60.3 → 0.70.0**: every provider, cost/us
 - Providers: Neuralwatt retry and endpoint parity, ZenMux expiry and PAYG handling, Manus iterates browser sessions, Cursor backs off forbidden cost requests for six hours, Ollama explains an empty manual cookie, Qoder regional cookie routing, DeepInfra retries transient billing requests, and z.ai shows unavailable quota instead of a fabricated 0% ([#624](https://github.com/nesszer/Win-CodexBar/pull/624), [#634](https://github.com/nesszer/Win-CodexBar/pull/634), [#635](https://github.com/nesszer/Win-CodexBar/pull/635), [#636](https://github.com/nesszer/Win-CodexBar/pull/636), [#638](https://github.com/nesszer/Win-CodexBar/pull/638), [#644](https://github.com/nesszer/Win-CodexBar/pull/644), [#683](https://github.com/nesszer/Win-CodexBar/pull/683), [#696](https://github.com/nesszer/Win-CodexBar/pull/696)).
 - Antigravity: estimate local history costs; Claude: contain oversized history values ([#602](https://github.com/nesszer/Win-CodexBar/pull/602), [#605](https://github.com/nesszer/Win-CodexBar/pull/605)).
 - Credentials: stage credential writes and publish them atomically ([#669](https://github.com/nesszer/Win-CodexBar/pull/669)).
+- Claude: when Hide Personal Info is enabled, keep saved account rows distinguishable with stable localized `Account N` labels and matching redacted tooltips ([#555](https://github.com/nesszer/Win-CodexBar/pull/555)).
+- Claude: reconcile account switches through activating, reconciling, and settled phases before reporting success ([#573](https://github.com/nesszer/Win-CodexBar/pull/573)).
+- Qwen: show an explicit `Weekly` label for weekly-only plans instead of a generic usage label ([#534](https://github.com/nesszer/Win-CodexBar/pull/534)).
+- Antigravity: fall back to structured CLI usage when the local probe is inconclusive ([#526](https://github.com/nesszer/Win-CodexBar/pull/526)).
+- Azure OpenAI: raise the reasoning-model liveness probe budget so reasoning models pass validation ([#525](https://github.com/nesszer/Win-CodexBar/pull/525)).
+- SSH: preserve username case in session hosts ([#554](https://github.com/nesszer/Win-CodexBar/pull/554)).
 
 ### Changed
 
@@ -98,6 +120,11 @@ Windows port of upstream CodexBar **0.60.3 → 0.70.0**: every provider, cost/us
 - Settings: show the running app version on the General tab ([#746](https://github.com/nesszer/Win-CodexBar/pull/746)).
 - Settings: animate the budget disclosure chevron ([#608](https://github.com/nesszer/Win-CodexBar/pull/608)).
 - Providers: retire the Crof provider safely ([#596](https://github.com/nesszer/Win-CodexBar/pull/596)).
+- Providers: retain usage through transient transport failures and keep last-good data on refresh failure ([#518](https://github.com/nesszer/Win-CodexBar/pull/518)).
+- Codex: use token expiry for OAuth validation instead of rejecting stale refresh timestamps ([#535](https://github.com/nesszer/Win-CodexBar/pull/535)).
+- Ports: port the 0.60.4 OpenRouter credits fallback and Codex workspace cache scope ([#514](https://github.com/nesszer/Win-CodexBar/pull/514), [#552](https://github.com/nesszer/Win-CodexBar/pull/552)).
+- Ports: port 0.60.5 Kimi Code ratio pools, Codex System Account label redaction, and OpenCode Go Monthly metric ([#543](https://github.com/nesszer/Win-CodexBar/pull/543), [#548](https://github.com/nesszer/Win-CodexBar/pull/548), [#550](https://github.com/nesszer/Win-CodexBar/pull/550)).
+- Ports: port Claude 0.60.5 parity fixes, Antigravity foreign-database history, and validated Codex windows during historical catch-up ([#542](https://github.com/nesszer/Win-CodexBar/pull/542), [#546](https://github.com/nesszer/Win-CodexBar/pull/546), [#547](https://github.com/nesszer/Win-CodexBar/pull/547)).
 
 ### Issues fixed
 
@@ -113,7 +140,7 @@ Thanks to @Pyaoya ([#611](https://github.com/nesszer/Win-CodexBar/pull/611)), @c
 
 ---
 
-## [Windows] 0.61.0 - 2026-09-15
+## [Windows] 0.61.0 - not released separately (first shipped in 0.70.0)
 
 Windows port of upstream CodexBar **0.60.3 → 0.61.0**: new subscription and
 spend providers (Nous Portal, Replicate, CodeRabbit, Muse Code), richer

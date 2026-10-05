@@ -128,7 +128,8 @@ pnpm run tauri:build
 
 - Rust: prefer focused `#[cfg(test)]` unit tests near the changed module. Run both manifests after Rust changes.
 - Frontend: Vitest 3 + jsdom + Testing Library. From `apps/desktop-tauri`: `pnpm test` (`src/**/*.{test,spec}.{ts,tsx}`).
-- **Hosted PR check**: CircleCI Windows is primary and runs `scripts/local-check.ps1 -Slice ci` for ordinary/canonical PRs and `main`; micro PRs targeting `port/upstream-*` intentionally skip hosted Windows compute; a micro-named PR targeting `main` does not. `.github/workflows/pr-check.yml` is manual Blacksmith Windows reserve only. Budget details: `CONTEXT.md`, `.github/CI.md`, and ADRs under `docs/adr/`.
+- **Hosted PR check**: CircleCI Windows is primary and runs `scripts/local-check.ps1 -Slice ci` for same-repository ordinary/canonical PRs and `main` (never for fork PRs); micro PRs targeting `port/upstream-*` intentionally skip hosted Windows compute; a micro-named PR targeting `main` does not. `.github/workflows/pr-check.yml` is manual Blacksmith Windows reserve only. Budget details: `CONTEXT.md`, `.github/CI.md`, and ADRs under `docs/adr/`.
+- **Fork PRs and reviews**: CircleCI never runs on fork PRs, and this project adds no CircleCI API token. Read the full diff, then run the `-Slice ci` steps from main's copy of `scripts/local-check.ps1` against the fork head (`pull/<number>/head`) in a disposable, credential-free Windows environment (Windows Sandbox or a throwaway VM; a worktree is not isolation), and post the result (see `.github/CI.md`). CodeRabbit (`.coderabbit.yaml`) reviews every PR, drafts included, against these rules; fix or answer its findings before merging.
 - **Hosted mirror**: `.\scripts\local-check.ps1 -Slice ci`. The default no-parameter developer slice remains available and does not run full installer/smoke unless requested.
 - Parser / fetcher changes: add deterministic samples or fixtures where practical.
 - No coverage thresholds are configured — do not invent any.
@@ -173,7 +174,7 @@ Then follow post-install instructions (permissions / accessibility as prompted).
   - Commands run (`cargo test`, `pnpm test`, `.\scripts\local-check.ps1`, etc.)
   - Screenshots / GIFs for UI changes (Windows)
   - Linked issue / reference when relevant
-- Hosted PR check exists: `ci/circleci: pr-check` is the primary Windows gate; `.github/workflows/pr-check.yml` is manual Blacksmith backup. Porting micro PRs targeting `port/upstream-*` use focused local evidence and intentionally skip automatic hosted Windows CI; `main`-bound PRs always get the hosted gate.
+- Hosted PR check exists: `ci/circleci: pr-check` is the primary Windows gate; `.github/workflows/pr-check.yml` is manual Blacksmith backup. Porting micro PRs targeting `port/upstream-*` use focused local evidence and intentionally skip automatic hosted Windows CI; same-repository `main`-bound PRs always get the hosted gate; fork PRs never do (see Fork PRs and reviews).
 - UI / tray / settings / float-bar / visual PRs: **CUA Driver proof is the default** ([trycua/cua](https://github.com/trycua/cua)) after a **fresh local rebuild** — see [UI validation with CUA](#ui-validation-with-cua-trycuacua). If CUA cannot be used, explain why and attach equivalent manual proof (PR template checkboxes).
 - Before non-trivial merge: thermo-nuclear structure review when the project process requires it.
 
@@ -187,4 +188,5 @@ Then follow post-install instructions (permissions / accessibility as prompted).
 - Before opening a Winget PR, verify the release installer URL resolves and recompute the SHA-256 from the downloaded asset. On Windows, run `winget validate` when available.
 - The first Winget package submission was approved in `microsoft/winget-pkgs#366653`; the v0.23.5 update was approved in `microsoft/winget-pkgs#366794`. Future updates should be faster, but still expect Microsoft validation/review.
 - Agents must route GitHub mutations through `scripts/gh-safe.sh` instead of calling mutating `gh` subcommands directly. This is the sole supported mutation wrapper. It owns repo binding, performs read-back verification, blocks repo overrides, and fails closed on target mismatch.
+- `gh-safe.sh` allowlists three repos: `nesszer/Win-CodexBar`, plus `Finesssee/winget-pkgs` (the fork that receives the manifest branch) and `microsoft/winget-pkgs` (where the winget PR opens).
 - For object mutations (PR/issue/release), bind both the exact `owner/repo` and exact object number/tag. Use repo-only verification only for creates where the target object does not exist yet.

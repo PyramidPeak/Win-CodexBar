@@ -123,6 +123,8 @@ pub struct AppState {
     /// Cursor location captured for a desktop launch; cleared by tray/other opens.
     pub flyout_cursor_anchor: Option<(f64, f64)>,
     pub provider_cache: Vec<ProviderUsageSnapshot>,
+    pub claude_account_usage: HashMap<String, crate::commands::ClaudeAccountUsageState>,
+    pub codex_account_needs_authentication: HashMap<uuid::Uuid, bool>,
     pub transient_provider_failure_counts: HashMap<ProviderId, u8>,
     /// Live session behind each provider's cached good snapshot, for
     /// owner-checked last-good retention. In memory only.
@@ -202,6 +204,8 @@ impl AppState {
             tray_anchor: None,
             flyout_cursor_anchor: None,
             provider_cache: Vec::new(),
+            claude_account_usage: HashMap::new(),
+            codex_account_needs_authentication: HashMap::new(),
             transient_provider_failure_counts: HashMap::new(),
             last_good_owners: HashMap::new(),
             provider_cache_updated_at: None,
