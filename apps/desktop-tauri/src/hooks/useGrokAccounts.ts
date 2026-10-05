@@ -19,11 +19,13 @@ export function useGrokAccounts({ reloadOnFocus = false }: { reloadOnFocus?: boo
     if (mounted.current && sequence === reloadSequence.current) setError(String(value));
   }, []);
 
+  // Resolves false only when the reload failed. A reload superseded by a newer
+  // one (e.g. a provider-updated event) is not a failure; the newer one applies.
   const reload = useCallback(async () => {
     const sequence = ++reloadSequence.current;
     try {
       const next = await grokAccountsList();
-      if (!mounted.current || sequence !== reloadSequence.current) return false;
+      if (!mounted.current || sequence !== reloadSequence.current) return true;
       setAccounts(next);
       setError(null);
       setUsage((previous) => Object.fromEntries(next.map((account) => [account.id, {
@@ -42,9 +44,9 @@ export function useGrokAccounts({ reloadOnFocus = false }: { reloadOnFocus?: boo
           }
         }),
       );
-      if (!mounted.current || sequence !== reloadSequence.current) return false;
       return true;
     } catch (value) {
+      if (sequence !== reloadSequence.current) return true;
       reportError(value, sequence);
       return false;
     }

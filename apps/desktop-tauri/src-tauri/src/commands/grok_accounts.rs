@@ -144,14 +144,19 @@ pub async fn grok_account_switch(app: tauri::AppHandle, id: String) -> Result<()
         .auth_text_for_usage(&id, false)
         .await
         .map_err(|error| error.to_string())?;
-    accounts::select_orca_account(&id)
-        .await
-        .map_err(|error| error.to_string())?;
     let _credentials = accounts::CREDENTIAL_OPERATION.lock().await;
-    tauri::async_runtime::spawn_blocking(move || AccountManager::new()?.switch(&id))
+    let local_id = id.clone();
+    tauri::async_runtime::spawn_blocking(move || AccountManager::new()?.switch(&local_id))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
     drop(_credentials);
-    refresh_after_grok_change(app)
+    // Select in Orca only after the local switch succeeded, so a failed switch
+    // never leaves Orca and the Grok CLI on different accounts. The local switch
+    // stands even if Orca fails, so refresh before reporting that error.
+    let orca = accounts::select_orca_account(&id)
+        .await
+        .map_err(|error| error.to_string());
+    refresh_after_grok_change(app)?;
+    orca
 }

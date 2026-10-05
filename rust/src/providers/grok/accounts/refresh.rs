@@ -67,6 +67,8 @@ impl AccountManager {
             .filter(|token| !token.is_empty())
             .ok_or(ProviderError::AuthRequired)?;
         let scope = entry.scope.to_owned();
+        // An unreadable store would discard the rotated token after the grant.
+        self.load().map_err(storage_error)?;
         let client = crate::core::credentialed_http_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(15))
@@ -124,8 +126,26 @@ impl AccountManager {
         if let Some(refresh) = response.refresh_token.filter(|token| !token.is_empty()) {
             entry.insert("refresh_token".into(), Value::String(refresh));
         }
-        self.reauthenticate(id, login).map_err(storage_error)?;
+        self.persist_renewed(id, login).map_err(storage_error)?;
         self.auth_text_for(id).map_err(storage_error)
+    }
+
+    /// Save a renewed login. Unlike `reauthenticate`, this never requires the
+    /// ambient file to be readable: the old refresh token is already spent.
+    fn persist_renewed(&self, id: &str, login: SavedLogin) -> io::Result<()> {
+        self.import(login.clone())?;
+        super::orca::update_login(id, &login)?;
+        // Replace the ambient login only when it readably holds this identity.
+        if let Ok(Some(current)) = read_login(&self.ambient_auth)
+            && current.id().ok().as_deref() == Some(id)
+        {
+            let staged = stage_json(&self.ambient_auth, &login.auth)?;
+            if let Err(error) = replace_staged(&staged, &self.ambient_auth) {
+                let _cleanup = std::fs::remove_file(staged);
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -220,6 +240,36 @@ mod tests {
         assert!(ambient.contains(&token("user-a")));
         assert!(ambient.contains("old-refresh"));
         assert!(manager.list().unwrap()[0].is_active);
+        request.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn renewal_is_saved_when_the_ambient_login_is_damaged() {
+        let (_dir, manager) = setup();
+        std::fs::create_dir_all(manager.ambient_auth.parent().unwrap()).unwrap();
+        std::fs::write(&manager.ambient_auth, "{not json").unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let request = server
+            .mock("POST", "/token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({"access_token":token("user-a"),"refresh_token":"rotated","expires_in":3600})
+                    .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let text = manager
+            .refresh_locked("user-a", false, &format!("{}/token", server.url()))
+            .await
+            .unwrap();
+        assert!(text.contains("rotated"));
+        assert!(manager.auth_text_for("user-a").unwrap().contains("rotated"));
+        assert_eq!(
+            std::fs::read_to_string(&manager.ambient_auth).unwrap(),
+            "{not json"
+        );
         request.assert_async().await;
     }
 
